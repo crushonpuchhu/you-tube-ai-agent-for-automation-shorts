@@ -1,0 +1,8 @@
+.env
+data/
+auth/*.json
+!auth/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+venv/

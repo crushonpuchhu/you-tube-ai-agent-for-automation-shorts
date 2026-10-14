@@ -1,0 +1,37 @@
+# Optional alternative to the long `docker run` command.
+#
+#   docker compose up -d --build     build + start
+#   docker compose logs -f           follow logs
+#   docker compose restart           apply a code change after rebuilding
+#   docker compose down              stop and remove the container
+#
+services:
+  shorts-agent:
+    build: .
+    image: shorts-agent:latest
+    container_name: shorts-agent
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # config.py falls back to ~/.shorts-agent/agent.db, which inside the
+      # container is /home/appuser/.shorts-agent/agent.db — that is NOT on a
+      # volume, so the database would vanish on every rebuild. Point it at the
+      # mounted volume instead.
+      AGENT_DB_PATH: /app/data/agent.db
+
+    volumes:
+      # DB + YouTube token + logs + downloaded videos. A named volume (not a
+      # bind mount) so it inherits the appuser ownership made in the Dockerfile
+      # and keeps SQLite on a real Linux filesystem.
+      - shorts-data:/app/data
+      # YouTube OAuth client secret, read-only. Never baked into the image.
+      - ./auth:/app/auth:ro
+
+    # No `ports:` — the bot uses Telegram long polling, so all traffic is
+    # outbound HTTPS and there is no inbound port to publish.
+
+volumes:
+  shorts-data:

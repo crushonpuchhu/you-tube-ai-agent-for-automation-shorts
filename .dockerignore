@@ -1,0 +1,39 @@
+# --- Secrets: must never be baked into the image ---------------------------
+.env
+.env.*
+!.env.example
+auth/*.json
+
+# --- Python caches ---------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Version control -------------------------------------------------------
+.git/
+.gitignore
+
+# --- Runtime data: lives in a Docker volume, not the image ------------------
+# config.py creates data/ and auth/ itself at import time, so the image only
+# needs the empty directories (made in the Dockerfile) with the right owner.
+data/videos/
+data/logs/
+data/tokens/
+data/*.db
+data/*.db-*
+*.db
+*.db-wal
+*.db-shm
+
+# --- Local editor / tooling noise ------------------------------------------
+.vscode/
+.idea/
+*.log

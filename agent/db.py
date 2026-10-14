@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from agent.clock import now_iso
+from agent.cleanup import delete_file
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -30,7 +31,7 @@ CREATE TABLE IF NOT EXISTS videos (
     file_path    TEXT NOT NULL,
     tg_file_id   TEXT,
     hint         TEXT,
-    status       TEXT NOT NULL DEFAULT 'submitted',
+    status       TEXT NOT NULL DEFAULT 'received',
     brief_json   TEXT,
     intent_json  TEXT,
     privacy      TEXT,
@@ -40,7 +41,9 @@ CREATE TABLE IF NOT EXISTS videos (
     verified_at  TEXT,
     daily_key    TEXT,
     scheduled_for TEXT,
-    error        TEXT
+    error        TEXT,
+    failed_stage TEXT,
+    retry_count  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
 CREATE INDEX IF NOT EXISTS idx_videos_daily  ON videos(daily_key);
@@ -98,6 +101,58 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 """
 
+# ---------------------------------------------------------------- statuses
+# Video lifecycle. Every stage transition goes through Database.set_status, so a
+# row always says exactly how far a video got.
+#
+#   received -> downloading -> processing -> analyzed --+--> uploading -> published
+#                    |            |            |        |
+#                    |            |            |        +-> scheduled (queued for later)
+#                    +------------+------------+---------> failed (failed_stage says where)
+#                                 \------------+---------> discarded (you tapped Discard)
+#
+# `published` is the terminal success state — this is the "uploaded" state from
+# the spec, deliberately kept named `published` so the daily goal, weekly report
+# and analytics that already read it keep working unchanged.
+STATUS_RECEIVED = "received"        # row created; bytes not on disk yet
+STATUS_DOWNLOADING = "downloading"  # pulling the file from Telegram
+STATUS_PROCESSING = "processing"    # Gemini writing title/description/tags
+STATUS_ANALYZED = "analyzed"        # metadata ready, waiting for your review
+STATUS_SCHEDULED = "scheduled"      # queued for a future publish time
+STATUS_UPLOADING = "uploading"      # talking to the YouTube API
+STATUS_PUBLISHED = "published"      # YouTube confirmed a video id
+STATUS_FAILED = "failed"            # see failed_stage + error
+STATUS_DISCARDED = "discarded"      # you tapped Discard
+
+#: Every value the `status` column may hold (used by /status counts).
+ALL_STATUSES = (
+    STATUS_RECEIVED, STATUS_DOWNLOADING, STATUS_PROCESSING, STATUS_ANALYZED,
+    STATUS_SCHEDULED, STATUS_UPLOADING, STATUS_PUBLISHED, STATUS_FAILED,
+    STATUS_DISCARDED,
+)
+
+#: In-flight / queued states: never deleted, because the pipeline still wants
+#: the file (or is actively using it right now).
+IN_FLIGHT = (
+    STATUS_RECEIVED, STATUS_DOWNLOADING, STATUS_PROCESSING,
+    STATUS_SCHEDULED, STATUS_UPLOADING,
+)
+
+#: Terminal state whose row must be preserved: the weekly report, analytics and
+#: smart-scheduling all read `published` rows for statistics.
+PROTECTED = IN_FLIGHT + (STATUS_PUBLISHED,)
+
+# The three stages the pipeline is split into. Stored in `failed_stage` so a
+# retry knows which one to re-run instead of starting from scratch.
+STAGE_DOWNLOAD = "download"   # Telegram -> disk
+STAGE_ANALYZE = "analyze"     # disk -> Gemini metadata
+STAGE_UPLOAD = "upload"       # disk -> YouTube
+
+STAGES = (STAGE_DOWNLOAD, STAGE_ANALYZE, STAGE_UPLOAD)
+
+#: Attempts allowed per stage before auto-retry is withdrawn (spec: 3).
+MAX_RETRIES = 3
+
 
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
@@ -152,6 +207,40 @@ class Database:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Bring a database created by an older build up to the current schema.
+
+        SQLite cannot add a column with a constraint inline, and the project has
+        no migration framework, so each addition is checked against
+        PRAGMA table_info — running this twice is a no-op.
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(videos)")}
+        for name, ddl in (
+            ("failed_stage", "TEXT"),
+            ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {ddl}")
+
+        # Older builds called the intake state 'submitted'.
+        conn.execute(
+            "UPDATE videos SET status=? WHERE status=?",
+            (STATUS_RECEIVED, "submitted"),
+        )
+        # Backfill the stage for rows that already failed, so /pending and the
+        # retry path know where they stopped: a row with no brief never got past
+        # the analysis stage; anything else died at the upload.
+        conn.execute(
+            "UPDATE videos SET failed_stage=? WHERE status=? AND failed_stage IS NULL "
+            "AND (brief_json IS NULL OR brief_json='' OR brief_json='{}')",
+            (STAGE_ANALYZE, STATUS_FAILED),
+        )
+        conn.execute(
+            "UPDATE videos SET failed_stage=? WHERE status=? AND failed_stage IS NULL",
+            (STAGE_UPLOAD, STATUS_FAILED),
+        )
 
     # --------------------------------------------------------------- settings
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -186,7 +275,7 @@ class Database:
         tg_file_id: str | None = None,
         hint: str | None = None,
         privacy: str | None = None,
-        status: str = "submitted",
+        status: str = STATUS_RECEIVED,
         intent: dict | None = None,
     ) -> int:
         with self._conn() as conn:
@@ -214,35 +303,97 @@ class Database:
         with self._conn() as conn:
             conn.execute(f"UPDATE videos SET {', '.join(keys)} WHERE id=?", tuple(values))
 
+    # ------------------------------------------------------- stage transitions
+    def set_status(self, video_id: int, status: str, **fields: Any) -> None:
+        """Move a video to the next pipeline stage in one atomic write.
+
+        This is the only sanctioned way to change `status`, so the DB never ends
+        up with a status set by one place and error/retry fields set by another.
+        """
+        self.update_video(video_id, status=status, **fields)
+
+    def mark_failed(self, video_id: int, stage: str, error: str,
+                    **extra: Any) -> int:
+        """Record a stage failure: status=failed, error_message, retry_count++.
+
+        The local file is deliberately left alone — a retry must be able to use
+        it without re-fetching from Telegram. Returns the new retry_count so the
+        caller can withdraw auto-retry once it passes MAX_RETRIES.
+        """
+        row = self.get_video(video_id)
+        if not row:
+            return 0
+        attempts = int(row.get("retry_count") or 0) + 1
+        self.update_video(
+            video_id,
+            status=STATUS_FAILED,
+            failed_stage=stage,
+            error=str(error),
+            retry_count=attempts,
+            **extra,
+        )
+        return attempts
+
+    def clear_failure(self, video_id: int) -> None:
+        """Forget a stage's failure bookkeeping once that stage succeeds.
+
+        retry_count is per-stage: it counts attempts since the last success, so a
+        video that got past analysis starts from 0 again when it later hits an
+        upload error and still gets the full budget of attempts.
+        """
+        self.update_video(video_id, error=None, failed_stage=None, retry_count=0)
+
+    def retries_left(self, video_id: int) -> int:
+        """Attempts remaining before auto-retry is withdrawn (never negative)."""
+        row = self.get_video(video_id)
+        if not row:
+            return 0
+        return max(0, MAX_RETRIES - int(row.get("retry_count") or 0))
+
     def get_video(self, video_id: int) -> dict | None:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
         return self._row_to_video(row)
 
-    def delete_video(self, video_id: int, keep_record: bool = False) -> bool:
-        """Remove a video row (and its file, unless keep_record).
+    def delete_video(self, video_id: int, keep_record: bool = False,
+                     force: bool = False) -> bool:
+        """Free a video's disk space, and optionally forget the record too.
 
-        Used to clean up videos that failed permanently or were abandoned, so
-        the DB and data/videos/ don't grow forever. Returns True if a row went.
+        The local file is always removed — reclaiming the storage is the whole
+        point. `keep_record` only decides whether the SQLite row survives as
+        history (`keep_record=True` keeps the row, clears `file_path` and marks
+        it discarded).
+
+        Protected rows are refused (returns False) unless `force=True`:
+        a video that is downloading, processing, scheduled or uploading must
+        survive a `/cleanup` typed while it works and a restart, and a
+        `published` row is the source the weekly report and analytics read.
+
+        Returns True when something was actually removed.
         """
         row = self.get_video(video_id)
         if not row:
             return False
-        # Never delete something the queue still intends to publish.
-        if row.get("status") in {"scheduled", "uploading", "publishing"}:
+        if not force and row.get("status") in PROTECTED:
             return False
-        if not keep_record:
+
+        path = row.get("file_path")
+        if path:
+            delete_file(path)
+
+        if keep_record:
+            self.update_video(video_id, file_path="", status=STATUS_DISCARDED)
+        else:
             with self._conn() as conn:
                 conn.execute("DELETE FROM videos WHERE id=?", (video_id,))
-        else:
-            self.update_video(video_id, file_path="", status="discarded")
         return True
 
-    def delete_videos_by_status(self, statuses: tuple[str, ...]) -> list[int]:
+    def delete_videos_by_status(self, statuses: tuple[str, ...],
+                                force: bool = False) -> list[int]:
         """Delete every video in the given statuses. Returns the removed ids."""
         removed: list[int] = []
         for row in self.list_videos(status=statuses, limit=5000):
-            if self.delete_video(row["id"]):
+            if self.delete_video(row["id"], force=force):
                 removed.append(row["id"])
         return removed
 

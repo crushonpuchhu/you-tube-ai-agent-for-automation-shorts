@@ -12,7 +12,13 @@ from typing import Callable
 from agent.analytics import YouTubeStats
 from agent.cleanup import discard_after_upload
 from agent.clock import now_iso, today_key
-from agent.db import Database
+from agent.db import (
+    STATUS_PUBLISHED,
+    STAGE_ANALYZE,
+    STAGE_DOWNLOAD,
+    STAGE_UPLOAD,
+    Database,
+)
 from agent.daily_goal import DailyGoalManager
 from agent.errors import AuthRequired, PublishError
 from agent.notifier import Notifier
@@ -76,14 +82,16 @@ class Publisher:
 
         brief_payload = video.get("brief") or {}
         if not brief_payload.get("title"):
-            self.db.update_video(video_row_id, status="failed",
-                                 error="No metadata (analysis) for this video.")
+            self.db.mark_failed(video_row_id, STAGE_ANALYZE,
+                                "No metadata (analysis) for this video.")
             raise PublishError("No metadata available for this video — re-run the analysis.")
 
         file_path = Path(video["file_path"])
         if not file_path.exists():
             message = f"Video file missing: {file_path}"
-            self.db.update_video(video_row_id, status="failed", error=message)
+            # A missing file is a storage problem, not an upload problem: the
+            # retry must re-fetch from Telegram rather than re-run the upload.
+            self.db.mark_failed(video_row_id, STAGE_DOWNLOAD, message)
             raise PublishError(message)
 
         brief = VideoBrief(
@@ -100,7 +108,7 @@ class Publisher:
         try:
             youtube_id = self.uploader.upload(file_path, brief, privacy, progress)
         except Exception as exc:  # noqa: BLE001
-            self.db.update_video(video_row_id, status="failed", error=str(exc))
+            self.db.mark_failed(video_row_id, STAGE_UPLOAD, str(exc))
             raise
 
         # --- verification: YouTube must confirm the video exists -------------
@@ -113,8 +121,10 @@ class Publisher:
             if not verified:
                 message = (f"YouTube returned id {youtube_id} but the video is not visible "
                            f"via the API — treating as failed.")
-                self.db.update_video(video_row_id, status="failed", youtube_id=youtube_id,
-                                     error=message)
+                # Keep the returned id: it is the only lead for investigating a
+                # verification failure in the YouTube Studio.
+                self.db.mark_failed(video_row_id, STAGE_UPLOAD, message,
+                                    youtube_id=youtube_id)
                 raise PublishError(message)
             verified_at = now_iso()
 
@@ -122,12 +132,16 @@ class Publisher:
         url = f"https://youtu.be/{youtube_id}"
         self.db.update_video(
             video_row_id,
-            status="published",
+            status=STATUS_PUBLISHED,
             youtube_id=youtube_id,
             url=url,
             published_at=stamp,
             verified_at=verified_at,
             daily_key=today_key(),
+            # The video made it: whatever stage failed before is now irrelevant,
+            # so the retry budget starts fresh for any future action.
+            failed_stage=None,
+            retry_count=0,
             error=None if can_verify else "published (upload API confirmed); "
                                           "videos.list verification pending — run auth --force",
         )

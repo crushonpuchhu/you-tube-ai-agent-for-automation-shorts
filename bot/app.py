@@ -30,7 +30,17 @@ from telegram.ext import (
 from agent.analytics import YouTubeStats
 from agent.clock import now_ist, to_iso, today_key
 from agent.daily_goal import DailyGoalManager
-from agent.db import Database
+from agent.db import (
+    STAGE_ANALYZE,
+    STAGE_DOWNLOAD,
+    STATUS_ANALYZED,
+    STATUS_DISCARDED,
+    STATUS_DOWNLOADING,
+    STATUS_FAILED,
+    STATUS_PROCESSING,
+    STATUS_RECEIVED,
+    Database,
+)
 from agent.errors import AuthRequired, ResearchError
 from agent.intent import (
     MODE_BEST,
@@ -236,7 +246,7 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     action = args[0].lower() if args else "list"
 
     if action == "failed":
-        removed = await asyncio.to_thread(db.delete_videos_by_status, ("failed",))
+        removed = await asyncio.to_thread(db.delete_videos_by_status, (STATUS_FAILED,))
         freed = 0
         await update.message.reply_text(
             f"🗑️ Deleted {len(removed)} failed video(s)"
@@ -245,8 +255,10 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if action == "all":
-        # Everything not protected: failed + analyzed + submitted + discarded.
-        removable = ("failed", "analyzed", "submitted", "discarded")
+        # Everything idle and abandoned. In-flight rows (downloading,
+        # processing, scheduled, uploading) are protected inside delete_video,
+        # and published rows are kept — the weekly report reads them.
+        removable = (STATUS_FAILED, STATUS_ANALYZED, STATUS_DISCARDED)
         removed = await asyncio.to_thread(db.delete_videos_by_status, removable)
         await update.message.reply_text(
             f"🗑️ Deleted {len(removed)} stored video(s)"
@@ -453,26 +465,21 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    status = await message.reply_text("⬇️ Downloading video…")
-
-    try:
-        file_id = tg_file.file_id
-        unique = getattr(tg_file, "file_unique_id", file_id)
-        suffix = Path(original_name).suffix.lower() or ".mp4"
-        if suffix not in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
-            suffix = ".mp4"
-        dest = VIDEO_DIR / f"{message.from_user.id}_{unique}{suffix}"
-        if not dest.exists():
-            tg = await context.bot.get_file(file_id)
-            await tg.download_to_drive(str(dest))
-    except Exception as exc:  # noqa: BLE001
-        log.exception("download failed")
-        await status.edit_text(f"❌ Download failed: {html.escape(str(exc))}")
-        return
+    # Resolve the destination path up front. The DB row is created BEFORE the
+    # bytes land, so a failure at any later stage still leaves a record that can
+    # be retried instead of a video that silently vanished with no trace.
+    file_id = tg_file.file_id
+    unique = getattr(tg_file, "file_unique_id", file_id)
+    suffix = Path(original_name).suffix.lower() or ".mp4"
+    if suffix not in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
+        suffix = ".mp4"
+    dest = VIDEO_DIR / f"{message.from_user.id}_{unique}{suffix}"
 
     hint = (message.caption or "").strip()
     intent = parse_intent(hint)
     intent_desc = describe_intent(intent) if hint else "❓ No instruction — you choose below"
+
+    status = await message.reply_text("🧾 Received — recording it…")
 
     video_id = db.insert_video(
         file_path=str(dest),
@@ -481,7 +488,7 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         tg_file_id=file_id,
         hint=hint or None,
         privacy=cfg.youtube_default_privacy,
-        status="submitted",
+        status=STATUS_RECEIVED,
         intent={
             "mode": intent.mode, "at": to_iso(intent.at) if intent.at else None,
             "day": intent.day.isoformat() if intent.day else None,
@@ -500,6 +507,32 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "awaiting_time": False,
     }
 
+    # ---- stage 1/3: download (Telegram -> disk) ------------------------------
+    db.set_status(video_id, STATUS_DOWNLOADING)
+    await status.edit_text("⬇️ Downloading video…")
+    try:
+        if not dest.exists():
+            tg = await context.bot.get_file(file_id)
+            await tg.download_to_drive(str(dest))
+        if not dest.exists():
+            # Telegram reported success but no bytes landed — treat it as a
+            # download failure rather than letting the analysis die later on a
+            # confusing "file not found".
+            raise FileNotFoundError(f"Telegram returned no file at {dest}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("download failed")
+        attempts = db.mark_failed(video_id, STAGE_DOWNLOAD, str(exc))
+        await status.edit_text(
+            f"❌ <b>Download failed</b> — video #{video_id}\n\n"
+            f"<code>{html.escape(str(exc))}</code>\n\n"
+            f"Stage: <b>download</b>. Attempt {attempts}.\n"
+            "The record is kept; send the video again to retry.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ---- stage 2/3: AI processing (disk -> Gemini) --------------------------
+    db.set_status(video_id, STATUS_PROCESSING)
     await status.edit_text(
         f"📤 Saved (#{video_id}).\n🧭 Instruction: {intent_desc}\n"
         "🧠 Analyzing with Gemini (watching + listening)… 30–60s."
@@ -516,18 +549,19 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, stat
         brief = await analyzer.analyze(Path(job["path"]), hint=job.get("hint", ""))
     except Exception as exc:  # noqa: BLE001
         log.exception("analysis failed")
-        # Do NOT mark the video "failed" and do NOT drop the job: the file is
-        # still on disk, so the user must be able to retry without re-sending it.
-        db.update_video(job["video_id"], status="submitted", error=str(exc))
-        job["attempts"] = int(job.get("attempts", 0)) + 1
+        # The file is still on disk, so the failure is recorded rather than
+        # thrown away: status becomes `failed`, the exact error is saved in
+        # `error_message`, `retry_count` is bumped, and the job stays in memory
+        # so the retry below re-runs only this stage with no re-upload.
+        attempts = db.mark_failed(job["video_id"], STAGE_ANALYZE, str(exc))
+        job["attempts"] = attempts
         job["last_error"] = str(exc)
         retry_button = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 Retry analysis", callback_data="regen"),
             InlineKeyboardButton("❌ Discard", callback_data="cancel"),
         ]])
-        attempts = job["attempts"]
         await status.edit_text(
-            f"❌ <b>Gemini analysis failed</b>\n\n"
+            f"❌ <b>Gemini analysis failed</b> — stage <b>analyze</b>\n\n"
             f"<code>{html.escape(str(exc))}</code>\n\n"
             f"📹 Your video <b>is still saved</b> (#{job['video_id']}) — nothing was lost.\n"
             f"Tried {attempts} time{'s' if attempts != 1 else ''}.\n\n"
@@ -540,9 +574,14 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, stat
     job["brief"] = brief
     db.update_video(
         job["video_id"],
-        status="analyzed",
+        status=STATUS_ANALYZED,
         brief_json=brief.to_dict(),
         privacy=job["privacy"],
+        # Analysis succeeded, so any failure recorded for an earlier attempt is
+        # stale: clear it and hand the retry budget back.
+        error=None,
+        failed_stage=None,
+        retry_count=0,
     )
 
     intent = job.get("intent")

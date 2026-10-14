@@ -6,12 +6,27 @@ import logging
 from datetime import datetime
 
 from agent.clock import now_ist, today_key
-from agent.db import Database
+from agent.db import (
+    STATUS_ANALYZED,
+    STATUS_DOWNLOADING,
+    STATUS_FAILED,
+    STATUS_PROCESSING,
+    STATUS_PUBLISHED,
+    STATUS_RECEIVED,
+    STATUS_SCHEDULED,
+    STATUS_UPLOADING,
+    Database,
+)
 from agent.notifier import Notifier
 
 log = logging.getLogger(__name__)
 
-OPEN_STATUSES = ("submitted", "analyzed", "scheduled", "uploading", "failed")
+#: Everything that still counts as "in the pipeline" for today's goal: it was
+#: accepted and has not reached a terminal state yet.
+OPEN_STATUSES = (
+    STATUS_RECEIVED, STATUS_DOWNLOADING, STATUS_PROCESSING, STATUS_ANALYZED,
+    STATUS_SCHEDULED, STATUS_UPLOADING, STATUS_FAILED,
+)
 
 
 class DailyGoalManager:
@@ -26,10 +41,10 @@ class DailyGoalManager:
     def progress(self, key: str | None = None) -> dict:
         key = key or today_key()
         goal = self.db.get_goal(key, self.target)
-        published = self.db.count_videos("published", daily_key=key)
-        submitted = self.db.count_videos(OPEN_STATUSES, daily_key=key)
+        published = self.db.count_videos(STATUS_PUBLISHED, daily_key=key)
+        in_progress = self.db.count_videos(OPEN_STATUSES, daily_key=key)
         scheduled_today = [
-            v for v in self.db.list_videos(status="scheduled", limit=100)
+            v for v in self.db.list_videos(status=STATUS_SCHEDULED, limit=100)
             if (v.get("scheduled_for") or "").startswith(key)
         ]
         target = int(goal.get("target") or self.target)
@@ -38,7 +53,7 @@ class DailyGoalManager:
             "key": key,
             "target": target,
             "published": published,
-            "submitted": submitted,
+            "in_progress": in_progress,
             "scheduled": len(scheduled_today),
             "scheduled_titles": [v.get("brief", {}).get("title") or "Untitled"
                                  for v in scheduled_today],
@@ -56,7 +71,7 @@ class DailyGoalManager:
             f"🎯 <b>Daily Shorts goal — {p['key']} (IST)</b>",
             "",
             f"{bar}  {p['published']}/{p['target']} published",
-            f"📤 Submitted to bot today: {p['submitted']}",
+            f"📤 Accepted today (in progress): {p['in_progress']}",
             f"⏱ Scheduled for today: {p['scheduled']}",
         ]
         if p["scheduled_titles"]:

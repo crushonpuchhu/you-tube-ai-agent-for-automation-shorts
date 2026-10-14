@@ -24,6 +24,10 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# NOTE: this module must not import agent.db. agent.db imports `delete_file`
+# from here (Database.delete_video frees the bytes it points at), so importing
+# it back would create an import cycle. Pass the database in as an argument.
+
 # Statuses that mean "this record will never read its file again".
 FINISHED = ("published", "failed")
 

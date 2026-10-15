@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Docker Hub variant — run the PREBUILT image instead of building locally.
+#
+#   1. Put .env, auth/client_secret.json and data/tokens/youtube_token.json
+#      next to this file (same three files as the local setup — they are
+#      mounted, never baked into the image).
+#   2. docker compose -f docker-compose.hub.yml pull
+#      docker compose -f docker-compose.hub.yml up -d
+#
+# Everything else (mounts, AGENT_DB_PATH, user, IN_DOCKER) is identical to
+# docker-compose.yml, so behavior is unchanged: the container reuses the
+# mounted YouTube token and refreshes it silently (never asks for auth), and
+# the SQLite database lives on the HOST at ~/.shorts-agent/agent.db.
+# ---------------------------------------------------------------------------
+services:
+  shorts-agent:
+    # prebuilt image on Docker Hub (published by scripts/publish-dockerhub.sh)
+    image: tallermittal/youtubeshortsaiagent:latest
+    container_name: shorts-agent
+    restart: unless-stopped
+
+    # Run as YOUR user so files on the bind mounts (SQLite WAL files, the
+    # refreshed YouTube token, logs) stay writable from both sides.
+    user: "${RUN_UID:-1000}:${RUN_GID:-1000}"
+
+    env_file:
+      - .env
+
+    environment:
+      IN_DOCKER: "1"          # also auto-detected via /.dockerenv
+      HOME: /home/appuser
+      # Forced, so a host-style AGENT_DB_PATH in .env can never create a
+      # second empty database inside the container.
+      AGENT_DB_PATH: /app/db/agent.db
+
+    volumes:
+      - ./data:/app/data       # YouTube token, logs, videos
+      - ${HOME}/.shorts-agent:/app/db   # SQLite agent.db (host side)
+      - ./auth:/app/auth:ro    # OAuth client secret

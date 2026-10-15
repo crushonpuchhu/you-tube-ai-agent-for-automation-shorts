@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Config  # noqa: E402
+from agent.errors import AuthRequired  # noqa: E402
 from pipeline.youtube_uploader import SCOPES, YouTubeUploader  # noqa: E402
 
 
@@ -41,12 +42,29 @@ def main() -> None:
             print(f"  - {scope}")
         print("Re-running the consent flow…\n")
 
+    # --force swaps the token only when the NEW consent succeeds: keep a backup
+    # so a failed attempt (Ctrl-C, rejected consent, container/headless machine)
+    # never leaves the agent without working credentials.
+    backup: str | None = None
     if "--force" in sys.argv and token.exists():
+        backup = token.read_text(encoding="utf-8")
         token.unlink()
         print("Existing token removed; running a fresh consent flow…")
 
     uploader = YouTubeUploader(cfg)
-    creds = uploader.credentials(allow_interactive=True)  # opens the browser
+    try:
+        creds = uploader.credentials(allow_interactive=True)  # opens the browser
+    except BaseException as exc:
+        if backup is not None:
+            token.parent.mkdir(parents=True, exist_ok=True)
+            token.write_text(backup, encoding="utf-8")
+            print("⚠ Consent did not finish — the previous token was restored.")
+        if isinstance(exc, AuthRequired):
+            # Container / headless machine: the browser flow cannot finish here,
+            # so say exactly why and where to authorize instead of hanging on a
+            # URL nobody can open.
+            raise SystemExit(f"\n🔐 {exc}") from None
+        raise
     remaining = YouTubeUploader(cfg).missing_scopes()
     print("\n✅ YouTube authorization saved.")
     print(f"   token file : {cfg.youtube_token_file}")

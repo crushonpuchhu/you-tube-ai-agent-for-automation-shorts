@@ -93,6 +93,101 @@ python main.py
 
 ---
 
+## 1.5 Running in Docker
+
+`Dockerfile` and `docker-compose.yml` are provided. Everything important lives
+on the **host** through bind mounts (no named volume), so stopping,
+restarting, rebuilding, removing or recreating the container never loses data:
+
+| Container path | Host path | Contains |
+|---|---|---|
+| `/app/data` | `./data` | **YouTube OAuth token** (`tokens/youtube_token.json`), logs, downloaded videos |
+| `/app/db` | `~/.shorts-agent` | **SQLite `agent.db`** — the *same* file local `python main.py` runs use |
+| `/app/auth` (ro) | `./auth` | OAuth client secret |
+
+```bash
+mkdir -p ~/.shorts-agent            # once: host folder for the database
+docker compose up -d --build         # build + start
+docker compose logs -f               # follow logs — expect "YouTube auth OK"
+docker compose restart               # apply a code change after rebuilding
+docker compose down                  # stop + remove the container (data stays on host)
+docker compose up -d --build         # rebuild & recreate — data still there
+```
+
+**Authentication inside Docker.** Run the one-time Google consent **on the
+host** (`python scripts/youtube_auth.py`). The token file lives in
+`./data/tokens`, which is bind-mounted into the container, so the container
+*reuses* those credentials and silently refreshes expired access tokens on
+every start — it never asks for authentication again. The interactive browser
+flow is deliberately disabled inside the container (`IN_DOCKER=1` is set by
+compose): a container has no browser and Google's redirect targets the
+container's own localhost, so attempting it could only repeat forever. If the
+token is missing, revoked, unreadable, or missing scopes, the bot still starts
+(Telegram + Gemini keep working), and the log/Telegram message explains *why*
+reauthorization is needed and says to run `python scripts/youtube_auth.py
+--force` **on the host**, then restart the container. (Remember: an API key
+alone cannot upload videos — that is what this OAuth refresh token is for.)
+
+**Upgrading from the previous named-volume setup** — the old compose file
+shadowed `./data` with the Docker volume `shorts-data`, which is exactly why
+the container could not see your existing token and re-asked every start. If
+that volume holds a database you want to keep:
+
+```bash
+docker compose down                                    # named volume is kept
+docker run --rm -v shorts-data:/old alpine ls -la /old # peek at what is inside
+# Copy the volume's agent.db out ONLY if ~/.shorts-agent/agent.db does not
+# exist yet; if both exist, compare them first (sqlite3 ... "select count(*) from videos")
+# and keep the one with your data:
+docker run --rm -v shorts-data:/old -v "$HOME/.shorts-agent:/new" alpine \
+  sh -c 'ls -la /old; [ -f /new/agent.db ] || cp -av /old/agent.db* /new/'
+docker compose up -d --build                           # new bind mounts
+docker volume rm shorts-data                           # once /status shows your data
+```
+
+Plain `docker run` equivalent (same mounts as compose):
+
+```bash
+docker build -t shorts-agent:latest .
+docker run -d --name shorts-agent --env-file .env --restart unless-stopped \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD/data:/app/data" -v "$HOME/.shorts-agent:/app/db" \
+  -v "$PWD/auth:/app/auth:ro" \
+  shorts-agent:latest
+```
+
+**Using a prebuilt image from Docker Hub.** The image only contains code +
+dependencies — `.env`, the OAuth client secret, the YouTube token and the
+database are always mounted from the host, so pulling from Docker Hub behaves
+exactly like building locally:
+
+```bash
+# once, on your dev machine — publish the image
+docker login
+docker build -t shorts-agent:latest .
+docker tag  shorts-agent:latest <your-dockerhub-username>/shorts-agent:latest
+docker push <your-dockerhub-username>/shorts-agent:latest
+
+# on the target host (e.g. EC2) — only the 4 files (3 secrets/data + compose)
+mkdir -p shorts-agent/{auth,data/tokens} ~/.shorts-agent
+scp .env auth/client_secret.json data/tokens/youtube_token.json docker-compose.hub.yml \
+    <user>@server:~/shorts-agent/
+ssh <user>@server 'cd ~/shorts-agent \
+  && chmod 600 .env auth/client_secret.json data/tokens/youtube_token.json \
+  && docker compose -f docker-compose.hub.yml pull \
+  && docker compose -f docker-compose.hub.yml up -d'
+```
+(`docker-compose.hub.yml` already points at
+`tallermittal/youtubeshortsaiagent:latest` — edit `image:` if you publish your
+own fork under a different name.)
+
+No auth prompt and an external database still hold for the Hub image: the
+Dockerfile sets `AGENT_DB_PATH=/app/db/agent.db` as the image default,
+`/.dockerenv` auto-disables the browser consent flow, and `Config.validate()`
+refuses to start if the `/app/db` mount is missing.
+
+---
+
 ## 2. Daily use
 
 Send a Short and **say what to do in the caption**:

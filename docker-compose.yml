@@ -1,9 +1,13 @@
-# Optional alternative to the long `docker run` command.
+# Recommended way to run the agent in Docker:
 #
 #   docker compose up -d --build     build + start
 #   docker compose logs -f           follow logs
 #   docker compose restart           apply a code change after rebuilding
 #   docker compose down              stop and remove the container
+#
+# Persistence: everything the agent must not lose lives on the HOST via bind
+# mounts (no named volume anymore), so stop / restart / rebuild / down / rm
+# never touches the YouTube token, the SQLite database or the logs.
 #
 services:
   shorts-agent:
@@ -12,26 +16,41 @@ services:
     container_name: shorts-agent
     restart: unless-stopped
 
+    # Run as YOUR host user (RUN_UID/RUN_GID in .env — `id -u` / `id -g`), not
+    # as the image's appuser. Bind-mounted files are then written with the same
+    # uid the host uses, so SQLite's WAL files and the refreshed YouTube token
+    # stay writable from BOTH the container and your local `python main.py`.
+    user: "${RUN_UID:-1000}:${RUN_GID:-1000}"
+
     env_file:
       - .env
 
     environment:
-      # config.py falls back to ~/.shorts-agent/agent.db, which inside the
-      # container is /home/appuser/.shorts-agent/agent.db — that is NOT on a
-      # volume, so the database would vanish on every rebuild. Point it at the
-      # mounted volume instead.
-      AGENT_DB_PATH: /app/data/agent.db
+      # Explicit container flag (config.in_container() also auto-detects
+      # /.dockerenv) — the YouTube browser consent flow is disabled inside.
+      IN_DOCKER: "1"
+      HOME: /home/appuser
+      # Force the SQLite path even if .env carries a host-style absolute path:
+      # env_file must never win here, or the agent would silently create a
+      # SECOND empty database inside the container's writable layer.
+      # /app/db is bind-mounted to the host folder below, so this is the SAME
+      # agent.db that non-Docker runs use — data survives every rebuild.
+      AGENT_DB_PATH: /app/db/agent.db
 
     volumes:
-      # DB + YouTube token + logs + downloaded videos. A named volume (not a
-      # bind mount) so it inherits the appuser ownership made in the Dockerfile
-      # and keeps SQLite on a real Linux filesystem.
-      - shorts-data:/app/data
+      # Host project folder -> container: the EXISTING YouTube OAuth token
+      # (./data/tokens/youtube_token.json), logs and downloaded videos. Because
+      # the token created on the host is visible here, the container reuses it
+      # and refreshes expired access tokens silently — no repeated interactive
+      # authentication at startup. (Previously a named volume shadowed this
+      # folder, so the container never saw the token and asked again every run.)
+      - ./data:/app/data
+      # SQLite on the host's native filesystem (the project drive is NTFS/FUSE,
+      # where SQLite locking is unreliable) — same file local runs already use,
+      # so existing rows are preserved and there is no second empty database.
+      - ${HOME}/.shorts-agent:/app/db
       # YouTube OAuth client secret, read-only. Never baked into the image.
       - ./auth:/app/auth:ro
 
     # No `ports:` — the bot uses Telegram long polling, so all traffic is
     # outbound HTTPS and there is no inbound port to publish.
-
-volumes:
-  shorts-data:

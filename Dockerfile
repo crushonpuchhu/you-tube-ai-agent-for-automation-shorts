@@ -14,10 +14,16 @@ RUN apt-get update \
 
 # PYTHONUNBUFFERED makes `docker logs -f` show output immediately; otherwise
 # Python buffers stdout and the terminal looks frozen until it exits.
+#
+# AGENT_DB_PATH: sane default for a plain `docker run` (docker-compose.yml
+# sets the same value explicitly). Without it the database would fall back to
+# ~/.shorts-agent inside the container's writable layer — an empty database
+# that vanishes on every rebuild. Still mount /app/db (and /app/data) to keep it.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    AGENT_DB_PATH=/app/db/agent.db
 
 WORKDIR /app
 
@@ -34,9 +40,11 @@ RUN useradd --create-home --uid 10001 appuser
 
 # Pre-create every path the agent writes to. A named volume inherits the
 # ownership of the directory it replaces, so doing this here is what lets
-# appuser write to the mounted volume later.
-RUN mkdir -p /app/data/videos /app/data/tokens /app/data/logs /app/auth \
-    && chown -R appuser:appuser /app/data /app/auth
+# appuser write to the mounted volume later. /app/db holds the SQLite database
+# (compose bind-mounts a host folder over it; the image copy is the fallback
+# for a bare `docker run` without mounts, so Database.__init__ can create it).
+RUN mkdir -p /app/data/videos /app/data/tokens /app/data/logs /app/db /app/auth \
+    && chown -R appuser:appuser /app/data /app/db /app/auth
 
 # Application code. .env, auth/*.json and data/ are excluded by .dockerignore
 # so no secret ever reaches the image.

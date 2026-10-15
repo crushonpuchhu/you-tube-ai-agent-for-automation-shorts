@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -17,7 +18,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
 from agent.errors import AuthRequired
-from config import Config
+from config import Config, in_container
 from pipeline.models import VideoBrief
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,21 @@ SCOPES = [
     "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 ProgressCallback = Callable[[int, str], None]
+
+
+def _browser_auth_possible() -> bool:
+    """Whether the installed-app consent flow can finish where we are.
+
+    `InstalledAppFlow.run_local_server` opens a browser and then waits for a
+    redirect to http://localhost:<random port>. Inside a container there is no
+    browser, the redirect would hit the container's own loopback (no port is
+    published), so the flow hangs and the token never gets saved — which is
+    exactly why Docker used to ask for authentication on every start. Without
+    an attached terminal there is nobody to read the URL either.
+    """
+    if in_container():
+        return False
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
 class YouTubeUploader:
@@ -53,17 +69,30 @@ class YouTubeUploader:
     def credentials(self, allow_interactive: bool = True) -> Credentials:
         """Load the saved token, refreshing it when expired; re-consent when scopes changed.
 
-        `allow_interactive=False` is used by every background path (scheduler,
-        analytics, research). A background thread must never open a browser —
-        there is nobody to click it, so it would hang forever. Instead it fails
-        fast with AuthRequired and the user gets a Telegram message telling them
-        the exact command to run.
+        The saved credentials are always reused: a still-valid token is returned
+        as-is and an expired one is refreshed with its refresh token (and written
+        back) — no browser, no consent page. Interactive consent is only started
+        when it can actually finish: never from a background path
+        (`allow_interactive=False` — a worker thread has nobody to click the
+        browser), never inside a container and never without an attached
+        terminal. In those cases we raise AuthRequired explaining WHY
+        reauthorization is needed and where to run it.
         """
         token_path: Path = self.cfg.youtube_token_file
         creds: Credentials | None = None
+        reason = ""
 
-        if token_path.exists() and not self.missing_scopes():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        if not token_path.exists():
+            reason = f"No saved YouTube token at {token_path}."
+        elif self.missing_scopes():
+            missing = ", ".join(s.rsplit("/", 1)[-1] for s in self.missing_scopes())
+            reason = f"The saved token is missing scopes: {missing}."
+        else:
+            try:
+                creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            except Exception as exc:  # noqa: BLE001 - corrupt token file
+                reason = f"The saved token file is unreadable ({exc})."
+                creds = None
 
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -72,19 +101,23 @@ class YouTubeUploader:
                 log.info("Refreshed YouTube OAuth token")
             except Exception as exc:  # token revoked -> re-consent
                 log.warning("Token refresh failed (%s); re-running consent flow", exc)
+                reason = (
+                    f"The saved token was rejected while refreshing ({exc}) — it was "
+                    "revoked, or the OAuth app is still in \"Testing\" (those refresh "
+                    "tokens expire after 7 days)."
+                )
                 creds = None
+        elif creds and creds.expired:
+            reason = "The saved token expired and carries no refresh token."
+            creds = None
 
         if not creds or not creds.valid:
             if not self.cfg.youtube_client_secret.exists():
                 raise FileNotFoundError(
                     f"Missing OAuth client secret: {self.cfg.youtube_client_secret}"
                 )
-            if not allow_interactive:
-                missing = ", ".join(self.missing_scopes()) or "expired credentials"
-                raise AuthRequired(
-                    "YouTube authorization required (missing: "
-                    f"{missing}). Run: python scripts/youtube_auth.py --force"
-                )
+            if not allow_interactive or not _browser_auth_possible():
+                raise AuthRequired(self._auth_required_message(reason))
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(self.cfg.youtube_client_secret), SCOPES
             )
@@ -103,6 +136,31 @@ class YouTubeUploader:
             log.info("YouTube consent completed; token saved with %d scopes", len(SCOPES))
 
         return creds
+
+    # --------------------------------------------------------- auth messaging
+    def _reauth_where(self) -> str:
+        """Clause telling the user where the consent flow can actually run."""
+        if in_container():
+            return " on the HOST machine (outside Docker), then restart the container"
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return " from a terminal with a browser"
+        return ""
+
+    def _auth_required_message(self, reason: str) -> str:
+        parts = ["YouTube authorization required."]
+        if reason:
+            parts.append(reason)
+        parts.append(
+            f"Run: python scripts/youtube_auth.py --force{self._reauth_where()}."
+        )
+        if in_container():
+            parts.append(
+                f"The token file ({self.cfg.youtube_token_file}) is shared with the "
+                "container through the ./data bind mount, so the freshly granted "
+                "token is picked up automatically — a browser can never open inside "
+                "the container, which is why it must not ask again here."
+            )
+        return " ".join(parts)
 
     def credentials_background(self) -> Credentials:
         """Non-interactive variant for background workers — never opens a browser."""
@@ -127,6 +185,7 @@ class YouTubeUploader:
         if not report["token_exists"]:
             report["hint"] = (
                 "No YouTube token yet. Run: python scripts/youtube_auth.py"
+                f"{self._reauth_where()}."
             )
             return report
 
@@ -135,13 +194,17 @@ class YouTubeUploader:
                 "Token is missing scopes "
                 f"({', '.join(s.rsplit('/', 1)[-1] for s in report['missing_scopes'])}). "
                 "Run once: python scripts/youtube_auth.py --force"
+                f"{self._reauth_where()}."
             )
             return report
 
         try:
             creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
         except Exception as exc:  # noqa: BLE001 - corrupt token file
-            report["hint"] = f"Token file unreadable ({exc}). Re-run with --force."
+            report["hint"] = (
+                f"Token file unreadable ({exc}). Re-run with --force"
+                f"{self._reauth_where()}."
+            )
             return report
 
         report["has_refresh_token"] = bool(creds.refresh_token)
@@ -159,7 +222,7 @@ class YouTubeUploader:
                     f"Refresh token rejected ({exc}). It was likely revoked or the "
                     "OAuth app is still in \"Testing\" (those expire after 7 days) — "
                     "set the consent screen to \"In production\", then run: "
-                    "python scripts/youtube_auth.py --force"
+                    f"python scripts/youtube_auth.py --force{self._reauth_where()}."
                 )
                 return report
 
@@ -167,6 +230,7 @@ class YouTubeUploader:
             report["hint"] = (
                 "Token has no refresh token, so it will expire within the hour. "
                 "Re-run: python scripts/youtube_auth.py --force"
+                f"{self._reauth_where()}."
             )
             return report
 

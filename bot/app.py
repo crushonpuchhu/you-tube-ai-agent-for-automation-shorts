@@ -74,6 +74,13 @@ def _short_slot(slot) -> str:
     return slot.run_at.strftime("%a %I:%M %p").replace(" 0", " ")
 
 
+def lowered_cancel(text: str) -> bool:
+    """True for the short 'no thanks' words people type to back out."""
+    return text.strip().lower().rstrip("!.").rstrip() in {
+        "cancel", "c", "no", "stop", "nevermind", "never mind", "abort", "exit",
+    }
+
+
 def _best_button_label(slot) -> str:
     return f"⏱ Best: {_short_slot(slot)}" if slot else "⏱ Best time"
 
@@ -747,6 +754,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 1) user is answering the "when?" prompt
     if job and job.get("awaiting_time"):
+        if lowered_cancel(text):
+            job["awaiting_time"] = False
+            context.user_data.pop("job", None)
+            await update.message.reply_text("❌ Cancelled. Send another video anytime.")
+            return
         if intent.mode == MODE_WHEN and intent.at:
             job["awaiting_time"] = False
             status = await update.message.reply_text("🗓 Scheduling…")
@@ -778,6 +790,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 3) normal refinement of the generated metadata
     if job and job.get("brief") is not None and intent.mode == "none":
+        # Tiny messages like "Hello" are chat, not creative direction —
+        # regenerating on those burned a whole Gemini call for nothing.
+        if len(text) < 10:
+            await update.message.reply_text(
+                "That looks like chat, not a change request 😊\n\n"
+                "To refine the metadata, tell me what to change, e.g.\n"
+                "<i>\"make the title funnier in Hinglish\"</i> or "
+                "<i>\"use a Hindi description with Punjabi touch\"</i>.\n\n"
+                "Or use the buttons: publish, schedule, regenerate, cancel.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         job["hint"] = text
         status = await update.message.reply_text("🧠 Regenerating with your direction…")
         await _run_analysis(update, context, status)
@@ -817,6 +841,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if action == "no" or job is None:
             context.user_data.pop("job", None)
             await query.edit_message_text("❌ Not scheduled. Send another video anytime.")
+            return
+        if not job.get("pending_slot"):
+            # The slot expired (bot restarted / job replaced) — never crash
+            # on a missing key, just ask for a fresh instruction.
+            await query.edit_message_text(
+                "⚠️ That slot is no longer valid. Send the video again, or tap "
+                "⏱ Best time on the review card.", parse_mode=ParseMode.HTML,
+            )
             return
         if action == "yes":
             from agent.clock import from_iso

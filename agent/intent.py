@@ -38,6 +38,14 @@ _WEEKDAYS = {
     "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
 }
 
+# Common typos / abbreviations people actually type in Telegram. Without this,
+# "Tommorow 7am" was silently treated as "no instruction".
+_DAY_FIXES = (
+    (re.compile(r"\btom{1,2}o?r{1,2}ow?\b"), "tomorrow"),
+    (re.compile(r"\b(?:tmrw|tmr|tmoro)\b"), "tomorrow"),
+    (re.compile(r"\b(?:todya|tody|todays)\b"), "today"),
+)
+
 _TIME_RE = re.compile(
     r"\b(\d{1,2})(?::|\.)?(\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b", re.IGNORECASE
 )
@@ -81,12 +89,14 @@ def _parse_time(text: str) -> time | None:
 
 def _parse_day(text: str, now: datetime) -> date | None:
     lowered = text.lower()
+    for pattern, replacement in _DAY_FIXES:
+        lowered = pattern.sub(replacement, lowered)
+    if "day after tomorrow" in lowered:
+        return (now + timedelta(days=2)).date()
     if "tomorrow" in lowered:
         return (now + timedelta(days=1)).date()
     if "today" in lowered or "tonight" in lowered:
         return now.date()
-    if "day after tomorrow" in lowered:
-        return (now + timedelta(days=2)).date()
 
     for word, weekday in _WEEKDAYS.items():
         if re.search(rf"\b{re.escape(word)}\b", lowered):
@@ -119,9 +129,13 @@ def parse_intent(text: str | None) -> PublishIntent:
             intent.matched = marker
             return intent
 
-    # 2) Explicit relative time ("in 2 hours")
+    # 2) Explicit relative time ("in 2 hours"). The "when?" prompt itself
+    # advertises this phrase, so it must work without extra verbs.
     match = _RELATIVE_RE.search(lowered)
-    if match and any(word in lowered for word in ("schedule", "publish", "upload", "post", "at")):
+    if match and (
+        any(word in lowered for word in ("schedule", "publish", "upload", "post", "at"))
+        or lowered.strip() == match.group(0).strip()
+    ):
         amount = int(match.group(1))
         delta = timedelta(hours=amount if match.group(2).lower().startswith("h") else 0,
                           minutes=0 if match.group(2).lower().startswith("h") else amount)
@@ -137,6 +151,10 @@ def parse_intent(text: str | None) -> PublishIntent:
         intent.day = day
         if when is not None:
             candidate = datetime.combine(day, when, tzinfo=now_ist().tzinfo)
+            # "today at 10 am" said at 8 PM would land in the past (and publish
+            # instantly) — push it to the next day instead.
+            if candidate <= now_ist():
+                candidate += timedelta(days=1)
             intent.mode = MODE_WHEN
             intent.at = ensure_ist(candidate)
             intent.matched = "day+time"

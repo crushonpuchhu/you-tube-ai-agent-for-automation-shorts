@@ -178,6 +178,13 @@ class VideoAnalyzer:
     # ----------------------------------------------------------------- parsing
     def _parse(self, text: str) -> VideoBrief:
         data = _json_loads_best_effort(text)
+        if not isinstance(data, dict):
+            # The model answered with a JSON array instead of an object —
+            # recover the first object inside it rather than crashing.
+            first = next((item for item in data if isinstance(item, dict)), None)
+            if first is None:
+                raise ValueError("Gemini did not return a JSON object with the video metadata.")
+            data = first
 
         hashtags = _clean_hashtags(data.get("hashtags") or [])
         if "#shorts" not in hashtags:
@@ -210,33 +217,31 @@ class VideoAnalyzer:
 
 
 # --------------------------------------------------------------------- helpers
-def _json_loads_best_effort(text: str) -> dict:
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
+def _json_loads_best_effort(text: str) -> dict | list:
+    """Parse a JSON object OR array from a model response.
 
-    # Strip ```json fences if the model added them anyway.
-    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match:
+    The video analyzer asks for an object, while /research asks for an array
+    of topics — both go through here, so both shapes must be accepted.
+    """
+    for candidate in (text, re.sub(r"^```(?:json)?|```$", "", text.strip(),
+                                   flags=re.MULTILINE).strip()):
         try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
                 return parsed
         except json.JSONDecodeError:
             pass
 
-    raise ValueError("Gemini did not return valid JSON metadata for this video.")
+    match = re.search(r"\{.*\}|\[.*\]", text.strip(), flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("Gemini did not return valid JSON for this request.")
 
 
 def _clean_hashtags(items) -> list[str]:

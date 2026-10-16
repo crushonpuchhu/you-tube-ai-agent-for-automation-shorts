@@ -307,6 +307,10 @@ async def build_report(db: Database, stats: YouTubeStats, llm: LLM, default_targ
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Report recommendations failed: %s", exc)
+        # A misbehaving model may answer with a list — never let that crash
+        # the whole report, it just drops the AI section.
+        if not isinstance(recommendations, dict):
+            recommendations = None
     return format_report(metrics, recommendations)
 
 

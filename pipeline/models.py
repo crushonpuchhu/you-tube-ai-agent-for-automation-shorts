@@ -19,3 +19,13 @@ class VideoBrief:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def get(self, key: str, default=None):
+        """Dict-style access.
+
+        The bot stores either a VideoBrief (fresh analysis) or a plain dict
+        (loaded from the DB) in the same slots, so both shapes must support
+        `.get(...)` — this used to crash with
+        "'VideoBrief' object has no attribute 'get'".
+        """
+        return getattr(self, key, default)

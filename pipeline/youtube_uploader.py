@@ -17,6 +17,14 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
+try:  # httpx is already a dependency (python-telegram-bot / google-genai)
+    import httpx
+    _NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+        OSError, TimeoutError, ConnectionError, httpx.HTTPError,
+    )
+except ImportError:  # pragma: no cover
+    _NETWORK_ERRORS = (OSError, TimeoutError, ConnectionError)
+
 from agent.errors import AuthRequired
 from config import Config, in_container
 from pipeline.models import VideoBrief
@@ -299,6 +307,20 @@ class YouTubeUploader:
                     time.sleep(2 ** attempt)
                     continue
                 raise RuntimeError(_friendly_http_error(exc)) from exc
+            except _NETWORK_ERRORS as exc:
+                # httpx.ReadError / resets mid-transfer: the resumable upload
+                # keeps its offset, so re-asking for the next chunk resumes
+                # where it stopped instead of losing the whole upload.
+                if attempt < retries:
+                    attempt += 1
+                    log.warning("Network error during upload (%s), retrying chunk (%d/%d)",
+                                exc, attempt, retries)
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(
+                    f"Network error during the YouTube upload: {exc}. "
+                    "Check the server's internet connection and try again."
+                ) from exc
 
             if status and progress:
                 percent = int(status.progress() * 100)

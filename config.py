@@ -130,9 +130,22 @@ class Config:
     youtube_token_file: Path
     youtube_default_category_id: str
     youtube_default_privacy: str
+    #: Refresh the access token this many minutes before it expires, so a long
+    #: upload never dies on a token that ran out mid-transfer.
+    youtube_leeway_minutes: int
 
     # Limits
     max_video_bytes: int
+
+    # --- text overlay (FFmpeg drawtext) ---
+    #: Master switch for the burn-in caption feature (needs FFmpeg installed).
+    text_overlay_enabled: bool
+    #: How long the bot waits for a caption choice before continuing WITHOUT
+    #: an overlay (so a video is never stuck waiting forever).
+    caption_timeout_minutes: int
+    #: ffmpeg / ffprobe executables (full paths if they are not on PATH).
+    ffmpeg_path: str
+    ffprobe_path: str
 
     # Storage hygiene — downloaded Shorts are deleted, not kept forever.
     delete_after_upload: bool
@@ -180,6 +193,11 @@ class Config:
             youtube_token_file=ROOT / _env("YOUTUBE_TOKEN_FILE", "data/tokens/youtube_token.json"),
             youtube_default_category_id=_env("YOUTUBE_DEFAULT_CATEGORY_ID", "24") or "24",
             youtube_default_privacy=(_env("YOUTUBE_DEFAULT_PRIVACY", "private") or "private").lower(),
+            youtube_leeway_minutes=max(1, _int("YOUTUBE_REFRESH_LEEWAY_MINUTES", 10)),
+            text_overlay_enabled=_bool("TEXT_OVERLAY_ENABLED", True),
+            caption_timeout_minutes=max(1, _int("CAPTION_TIMEOUT_MINUTES", 15)),
+            ffmpeg_path=_env("FFMPEG_PATH", "ffmpeg") or "ffmpeg",
+            ffprobe_path=_env("FFPROBE_PATH", "ffprobe") or "ffprobe",
             max_video_bytes=int(max_mb * 1024 * 1024),
             delete_after_upload=_bool("DELETE_AFTER_UPLOAD", True),
             video_retention_days=max(0, _int("VIDEO_RETENTION_DAYS", 3)),

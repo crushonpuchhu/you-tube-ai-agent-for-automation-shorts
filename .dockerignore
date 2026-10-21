@@ -37,3 +37,7 @@ data/*.db-*
 .vscode/
 .idea/
 *.log
+
+# Browser snapshots recorded while driving the Google Cloud console setup
+# assistant. Session artefacts, never application code.
+.playwright-mcp/

@@ -7,9 +7,14 @@ FROM python:3.12-slim
 # agent/clock.py runs `ZoneInfo("Asia/Kolkata")` at import time, and the slim
 # image ships WITHOUT the IANA timezone database. Without tzdata the import
 # raises ZoneInfoNotFoundError and the whole agent dies before it starts.
+#
+# ffmpeg + fonts-dejavu-core power the burned-in text-overlay feature
+# (pipeline/overlay.py uses the drawtext/libfreetype filter). fonts-dejavu
+# supplies the TrueType font drawtext needs to render — without a font on
+# disk the overlay fails with a clear error instead of silently skipping.
 # ---------------------------------------------------------------------------
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata ffmpeg fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # PYTHONUNBUFFERED makes `docker logs -f` show output immediately; otherwise

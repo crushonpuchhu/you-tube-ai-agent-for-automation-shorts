@@ -257,14 +257,42 @@ class Database:
             )
 
     # ----------------------------------------------------------- notifications
-    def claim_notification(self, dedupe_key: str) -> bool:
-        """True the first time a given notification key is used, False afterwards."""
+    def claim_notification(self, dedupe_key: str,
+                           window_seconds: float | None = None) -> bool:
+        """True when a notification with this key may be sent right now.
+
+        Without a window the key can only ever be claimed once (legacy
+        behaviour). With a window the claim is granted again once the previous
+        send is older than `window_seconds`, so a recurring problem (e.g. a
+        revoked YouTube token checked every 45 minutes) does not spam the chat
+        while a genuinely NEW occurrence still reaches the owner.
+        """
+        from datetime import datetime as _dt
+
+        now = now_iso()
         with self._conn() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO notifications(dedupe_key, sent_at) VALUES(?,?)",
-                (dedupe_key, now_iso()),
+                (dedupe_key, now),
             )
-        return cur.rowcount == 1
+            if cur.rowcount == 1:
+                return True
+            if window_seconds is None:
+                return False
+            row = conn.execute(
+                "SELECT sent_at FROM notifications WHERE dedupe_key=?", (dedupe_key,)
+            ).fetchone()
+            try:
+                sent = _dt.fromisoformat(row["sent_at"])
+                current = _dt.fromisoformat(now)
+            except (ValueError, TypeError, AttributeError):
+                return False
+            if (current - sent).total_seconds() < window_seconds:
+                return False
+            conn.execute(
+                "UPDATE notifications SET sent_at=? WHERE dedupe_key=?", (now, dedupe_key)
+            )
+            return True
 
     # ----------------------------------------------------------------- videos
     def insert_video(

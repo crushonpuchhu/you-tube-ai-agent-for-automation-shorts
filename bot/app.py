@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 from agent.analytics import YouTubeStats
+from agent.caption import extract_custom_text, parse_choice
 from agent.clock import now_ist, to_iso, today_key
 from agent.daily_goal import DailyGoalManager
 from agent.db import (
@@ -60,6 +61,7 @@ from agent.weekly import build_decisions, build_report
 from config import Config, VIDEO_DIR
 from pipeline.analyzer import CATEGORIES, VideoAnalyzer
 from pipeline.models import VideoBrief
+from pipeline.overlay import TextOverlayEngine
 from pipeline.youtube_uploader import YouTubeUploader
 
 log = logging.getLogger(__name__)
@@ -237,7 +239,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("job", None)
+    job = context.user_data.pop("job", None)
+    if job:
+        _clear_caption_timeout(job)
     await update.message.reply_text("🗑️ Cleared. Send me a new video whenever you're ready.")
 
 
@@ -486,6 +490,10 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     intent = parse_intent(hint)
     intent_desc = describe_intent(intent) if hint else "❓ No instruction — you choose below"
 
+    # Mode B: the creator supplied the exact overlay text in the caption
+    # (e.g. `Add this text: "…"`). Used verbatim, never rewritten.
+    custom_overlay = extract_custom_text(hint) if hint else None
+
     status = await message.reply_text("🧾 Received — recording it…")
 
     video_id = db.insert_video(
@@ -512,6 +520,10 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "brief": None,
         "pending_slot": None,
         "awaiting_time": False,
+        "chat_id": message.chat.id,
+        "custom_overlay_text": custom_overlay,
+        "overlay_done": False,
+        "awaiting_caption": False,
     }
 
     # ---- stage 1/3: download (Telegram -> disk) ------------------------------
@@ -592,6 +604,185 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, stat
     )
 
     intent = job.get("intent")
+    # Optional text overlay (FFmpeg drawtext) — resolve BEFORE the review card
+    # or any publish/schedule action, so the burned-in video is what goes out.
+    if _overlay_enabled(context) and not job.get("overlay_done"):
+        if await _resolve_overlay(context, job, status):
+            return  # paused: waiting for the creator to pick/enter/skip a caption
+
+    await _finalize_job(context, job, status)
+
+
+def _overlay_enabled(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when the text-overlay feature is on AND FFmpeg is usable."""
+    cfg: Config = context.application.bot_data["cfg"]
+    if not cfg.text_overlay_enabled:
+        return False
+    engine = context.application.bot_data.get("overlay")
+    return engine is not None and engine.available(cfg)
+
+
+async def _resolve_overlay(context: ContextTypes.DEFAULT_TYPE, job: dict, status) -> bool:
+    """Resolve the text overlay for this video.
+
+    Returns True when we PAUSED (awaiting a caption choice from the creator),
+    False when the flow should continue straight to `_finalize_job`.
+    * Mode B (custom text in the caption) is applied immediately, no prompt.
+    * Mode A/C (no text): 3 AI captions are offered via inline buttons with a
+      timeout that falls back to "no overlay" — the agent never hangs.
+    """
+    cfg: Config = context.application.bot_data["cfg"]
+    analyzer: VideoAnalyzer = context.application.bot_data["analyzer"]
+
+    # Mode B: creator already supplied the exact text.
+    custom = job.get("custom_overlay_text")
+    if custom:
+        await _apply_overlay_and_continue(context, job, custom, status, prompt=False)
+        return False
+
+    # Mode A/C: generate suggestions (best-effort; never blocks the pipeline).
+    await status.edit_text("🧠 Watching the video to suggest overlay captions…")
+    captions = await analyzer.suggest_captions(Path(job["path"]), hint=job.get("hint", ""))
+    if not captions:
+        log.info("No overlay captions generated for #%s — continuing without overlay",
+                 job["video_id"])
+        job["overlay_done"] = True
+        return False
+
+    job["caption_suggestions"] = captions
+    job["awaiting_caption"] = True
+    buttons = [
+        [InlineKeyboardButton(f"{i}. {cap[:40]}", callback_data=f"cap:{i}")]
+        for i, cap in enumerate(captions)
+    ]
+    buttons.append([
+        inline := InlineKeyboardButton("✏️ My own text", callback_data="cap:custom"),
+        InlineKeyboardButton("⏭ Skip overlay", callback_data="cap:skip"),
+    ])
+    from agent.caption import format_suggestions
+    await status.edit_text(
+        format_suggestions(captions, cfg.caption_timeout_minutes),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    _start_caption_timeout(context, job)
+    return True
+
+
+def _start_caption_timeout(context: ContextTypes.DEFAULT_TYPE, job: dict) -> None:
+    """Schedule the 'continue without overlay' fallback after a timeout."""
+    cfg: Config = context.application.bot_data["cfg"]
+    loop = asyncio.get_running_loop()
+    minutes = cfg.caption_timeout_minutes
+
+    def _fire() -> None:
+        # Only continue if the creator is still silent on this same job.
+        if job.get("awaiting_caption"):
+            job["awaiting_caption"] = False
+            job["overlay_done"] = True
+            context.application.create_task(
+                _continue_without_overlay(context, job, minutes)
+            )
+
+    handle = loop.call_later(minutes * 60, _fire)
+    job["caption_timeout"] = handle
+
+
+def _clear_caption_timeout(job: dict) -> None:
+    handle = job.pop("caption_timeout", None)
+    if handle is not None:
+        try:
+            handle.cancel()
+        except Exception:  # noqa: BLE001 - already-fired timers are fine
+            pass
+
+
+async def _continue_without_overlay(context: ContextTypes.DEFAULT_TYPE, job: dict,
+                                    minutes: int) -> None:
+    """Timeout path: notify and proceed with the ORIGINAL video (no overlay)."""
+    chat_id = job.get("chat_id")
+    text = (
+        f"⏭ No caption chosen within {minutes} min — continuing without a text "
+        "overlay. The video stays exactly as you sent it.\n\n"
+        "Send a video with your own text any time (e.g. "
+        "<i>Add this text: \"…\"</i>)."
+    )
+    try:
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=text,
+                                           parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001 - notification only
+        log.warning("Could not send overlay-timeout notice")
+    db: Database = context.application.bot_data["db"]
+    await _finalize_job(context, job, None, db=db)
+
+
+async def _apply_overlay_and_continue(context: ContextTypes.DEFAULT_TYPE, job: dict,
+                                      text: str, status, prompt: bool = True) -> None:
+    """Burn `text` onto the video with FFmpeg, then continue the flow.
+
+    On overlay failure we CONTINUE with the original video (never lose the
+    publish) and tell the creator what went wrong.
+    """
+    engine = context.application.bot_data["overlay"]
+    db: Database = context.application.bot_data["db"]
+    source = Path(job["path"])
+    if status is not None:
+        await status.edit_text(f"🎞 Applying text overlay:\n<i>{html.escape(text)}</i>")
+
+    try:
+        processed = await asyncio.to_thread(engine.apply, source, text)
+    except Exception as exc:  # noqa: BLE001 - OverlayError or unexpected
+        log.exception("text overlay failed for #%s", job["video_id"])
+        job["overlay_done"] = True
+        if status is not None:
+            await status.edit_text(
+                f"⚠️ <b>Text overlay could not be applied</b>\n\n"
+                f"<code>{html.escape(str(exc))}</code>\n\n"
+                "Continuing with the <b>original</b> video (no overlay).",
+                parse_mode=ParseMode.HTML,
+            )
+        await _finalize_job(context, job, status, db=db)
+        return
+
+    # Point the job + DB at the processed file; drop the original to save disk.
+    job["path"] = str(processed)
+    job["overlay_done"] = True
+    job["overlay_text"] = text
+    db.update_video(job["video_id"], file_path=str(processed))
+    if processed != source:
+        try:
+            source.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not delete original video %s (sweep will reclaim it)", source)
+
+    if status is not None:
+        await status.edit_text("✅ Text overlay applied — continuing…")
+    await _finalize_job(context, job, status, db=db)
+
+
+async def _finalize_job(context: ContextTypes.DEFAULT_TYPE, job: dict, status,
+                        db: Database | None = None) -> None:
+    """Dispatch to the intent path (publish/schedule/best) or the review card.
+
+    This is the original tail of `_run_analysis`, extracted so the overlay
+    step can pause and then resume the exact same flow.
+    """
+    if db is None:
+        db = context.application.bot_data["db"]
+    brief = job.get("brief")
+    intent = job.get("intent")
+
+    # The overlay timeout path resumes with no live status message — send a
+    # fresh one so every branch below can safely edit it.
+    if status is None:
+        chat_id = job.get("chat_id")
+        if not chat_id:
+            log.error("finalize_job: no status message and no chat_id for #%s",
+                      job.get("video_id"))
+            return
+        status = await context.bot.send_message(chat_id=chat_id, text="⏳ Continuing…")
+
     if intent and intent.mode == MODE_NOW:
         await status.edit_text("✅ Metadata ready — publishing immediately as instructed…")
         await _publish_now(context, job, status)
@@ -612,7 +803,6 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, stat
     slot = None
     try:
         cfg: Config = context.application.bot_data["cfg"]
-        db: Database = context.application.bot_data["db"]
         slot = await asyncio.to_thread(
             recommend, db, None, cfg.daily_goal, cfg.min_gap_hours, cfg.min_lead_minutes
         )
@@ -621,8 +811,13 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, stat
     except Exception:  # noqa: BLE001 - the card must still render without a slot
         log.exception("could not precompute a best slot")
 
+    overlay_note = ""
+    if job.get("overlay_text"):
+        overlay_note = f"\n<b>🖼 Text overlay:</b> <i>{html.escape(job['overlay_text'])}</i>\n"
+
     await status.edit_text(
-        _preview_html(brief, job["privacy"], category_name, note, slot=slot),
+        _preview_html(brief, job["privacy"], category_name, note, slot=slot)
+        + overlay_note,
         parse_mode=ParseMode.HTML,
         reply_markup=_keyboard(job["privacy"], best_slot=slot),
     )
@@ -752,6 +947,61 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.message.text or "").strip()
     intent = parse_intent(text)
 
+    # 0) overlay caption selection (Mode A/C): pick 1/2/3 or type own text
+    if job and job.get("awaiting_caption"):
+        _clear_caption_timeout(job)
+        suggestions = job.get("caption_suggestions") or []
+        idx = parse_choice(text)
+        if idx is not None and 0 <= idx < len(suggestions):
+            job["awaiting_caption"] = False
+            status = await update.message.reply_text(
+                f"✅ Using caption {idx + 1}: <i>{html.escape(suggestions[idx])}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            await _apply_overlay_and_continue(context, job, suggestions[idx], status)
+            return
+        if lowered_cancel(text):
+            job["awaiting_caption"] = False
+            job["overlay_done"] = True
+            status = await update.message.reply_text(
+                "⏭ Skipping the text overlay — continuing with your original video…"
+            )
+            await _finalize_job(context, job, status)
+            return
+        # Anything else is treated as the creator's own overlay text (Mode B).
+        custom = extract_custom_text(text) or " ".join(text.split())
+        custom = custom.strip()[:140]
+        if custom:
+            job["awaiting_caption"] = False
+            status = await update.message.reply_text(
+                f"✅ Using your text: <i>{html.escape(custom)}</i>", parse_mode=ParseMode.HTML
+            )
+            await _apply_overlay_and_continue(context, job, custom, status)
+            return
+        await update.message.reply_text(
+            "Send a number (1/2/3), your own caption text, or /reset to cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 0b) creator is typing their own overlay text after tapping "My own text"
+    if job and job.get("awaiting_caption_text"):
+        job["awaiting_caption_text"] = False
+        custom = extract_custom_text(text) or " ".join(text.split())
+        custom = custom.strip()[:140]
+        if lowered_cancel(text) or not custom:
+            job["overlay_done"] = True
+            status = await update.message.reply_text(
+                "⏭ No text given — continuing WITHOUT a text overlay…"
+            )
+            await _finalize_job(context, job, status)
+            return
+        status = await update.message.reply_text(
+            f"✅ Using your text: <i>{html.escape(custom)}</i>", parse_mode=ParseMode.HTML
+        )
+        await _apply_overlay_and_continue(context, job, custom, status)
+        return
+
     # 1) user is answering the "when?" prompt
     if job and job.get("awaiting_time"):
         if lowered_cancel(text):
@@ -834,6 +1084,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     data = query.data
     job = context.user_data.get("job")
+
+    # ---- text-overlay caption selection (Mode A/C) ----
+    if data.startswith("cap:") and job is not None:
+        _clear_caption_timeout(job)
+        choice = data.split(":", 1)[1]
+        if choice == "skip":
+            job["awaiting_caption"] = False
+            job["overlay_done"] = True
+            status = await query.edit_message_text(
+                "⏭ Skipping the text overlay — continuing with your original video…"
+            )
+            await _finalize_job(context, job, status)
+            return
+        if choice == "custom":
+            job["awaiting_caption_text"] = True
+            await query.edit_message_text(
+                "✏️ Send me the exact text you want overlaid on the video "
+                "(one line works best)."
+            )
+            return
+        # A numbered suggestion.
+        suggestions = job.get("caption_suggestions") or []
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(suggestions):
+            job["awaiting_caption"] = False
+            status = await query.edit_message_text(
+                f"✅ Using caption {idx + 1}: <i>{html.escape(suggestions[idx])}</i>"
+            )
+            await _apply_overlay_and_continue(context, job, suggestions[idx], status)
+            return
+        await query.edit_message_text(
+            "⚠️ That caption choice expired. Send the video again, or tap a button."
+        )
+        return
 
     # ---- slot confirmation (no job needed to cancel) ----
     if data.startswith("slot:"):
@@ -967,6 +1254,13 @@ def build_application(cfg: Config) -> Application:
     # non-interactive provider so they can never stall on a browser prompt.
     stats = YouTubeStats(uploader.credentials_background, uploader.missing_scopes)
     notifier = Notifier(int(cfg.telegram_chat_id) if cfg.telegram_chat_id else None)
+    # Wire the uploader's Telegram alerts + time-windowed dedupe so a revoked
+    # refresh token is reported ONCE (not spammed every 45 min) and so the
+    # automatic recovery is announced when it happens.
+    uploader.bind_notifications(
+        notifier=notifier,
+        claim=lambda key, window: db.claim_notification(key, window_seconds=window),
+    )
     goal = DailyGoalManager(db, notifier, target=cfg.daily_goal, reminder_times=cfg.reminder_times)
     publisher = Publisher(db, uploader, stats, goal, notifier,
                           delete_after_upload=cfg.delete_after_upload)
@@ -993,6 +1287,7 @@ def build_application(cfg: Config) -> Application:
         "research": research,
         "scheduler": scheduler,
         "analyzer": VideoAnalyzer(cfg),
+        "overlay": TextOverlayEngine(cfg),
     })
 
     app.add_handler(TypeHandler(Update, _capture_chat), group=-1)

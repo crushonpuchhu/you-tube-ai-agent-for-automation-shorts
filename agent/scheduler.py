@@ -30,6 +30,11 @@ log = logging.getLogger(__name__)
 
 RETRY_BASE_MINUTES = 5
 
+# Keep the YouTube access token warm: refresh it on this cadence even when no
+# Short is published, so a revoked refresh token is discovered within the hour
+# instead of at publish time.
+TOKEN_REFRESH_MINUTES = 45
+
 
 class Scheduler:
     def __init__(
@@ -127,6 +132,13 @@ class Scheduler:
         slot = f"{now.strftime('%Y-%m-%d')}T{now.hour // step}"
         self.db.add_task("analytics_sync", now_iso(), dedupe_key=f"sync:{slot}")
 
+        # YouTube token maintenance (default every 45 min) — keeps the access
+        # token fresh and detects a revoked refresh token within the hour.
+        step = max(5, TOKEN_REFRESH_MINUTES)
+        slot = int(now.timestamp() // (step * 60))
+        self.db.add_task("youtube_token_refresh", now_iso(),
+                         dedupe_key=f"yt-refresh:{slot}")
+
         # Daily content research, once the configured hour has passed.
         if cfg.research_enabled and now.hour >= cfg.research_hour:
             self.db.add_task("research", now_iso(),
@@ -204,12 +216,13 @@ class Scheduler:
         attempts = int(task.get("attempts") or 0)
         max_attempts = int(task.get("max_attempts") or 3)
 
-        if auth and self.db.claim_notification(f"auth:{task['kind']}"):
+        if auth and self.db.claim_notification(f"auth:{task['kind']}",
+                                               window_seconds=6 * 3600):
             self.notifier.send(
                 "🔐 <b>YouTube authorization is required</b>\n\n"
                 f"Task: {task['kind']}\n{error}\n\n"
-                "Run <code>python scripts/youtube_auth.py --force</code> and the "
-                "agent will retry automatically."
+                "Run <code>python scripts/youtube_auth.py --force</code> (on the host, "
+                "outside Docker) and the agent will retry automatically."
             )
 
         if attempts + 1 >= max_attempts:
@@ -237,6 +250,10 @@ class Scheduler:
             self.publisher.publish_and_notify(int(payload["video_id"]))
             return
 
+        if kind == "youtube_token_refresh":
+            self._refresh_youtube_token()
+            return
+
         if kind == "analytics_sync":
             videos = self.db.list_videos(status="published", limit=60)
             if videos:
@@ -258,6 +275,30 @@ class Scheduler:
             return
 
         log.warning("Unknown task kind: %s", kind)
+
+    def _refresh_youtube_token(self) -> None:
+        """Proactively refresh the YouTube token before it expires.
+
+        Runs every ~45 minutes as a background task. Keeps the access token
+        fresh between uploads and, critically, surfaces a revoked refresh
+        token within the hour (as an auth failure -> Telegram alert) instead
+        of when a scheduled Short is due.
+        """
+        uploader = getattr(self.publisher, "uploader", None)
+        if uploader is None:
+            return
+        report = uploader.background_refresh()
+        if report.get("ok"):
+            return
+        if report.get("auth"):
+            # Genuine rejection — raise so the standard auth path notifies
+            # (time-deduplicated) and retries with backoff.
+            raise AuthRequired(report.get("error") or "YouTube token rejected.")
+        # Transient: network to Google is down. Retry with the normal backoff;
+        # do NOT alarm the owner (it usually recovers by itself).
+        raise RuntimeError(
+            f"Background YouTube token refresh failed: {report.get('error', 'unknown')}"
+        )
 
     def _send_weekly_report(self) -> None:
         from agent.weekly import build_report

@@ -74,7 +74,16 @@ Default model `gemini-3.5-flash-lite` handles video natively.
 2. **APIs & Services → Library** → enable **YouTube Data API v3**
 3. **APIs & Services → Library** → enable **YouTube Analytics API** (weekly report metrics)
 4. **OAuth consent screen** → External → add your Google account under **Test users**
-5. **Credentials → Create OAuth client ID → Desktop app** → download JSON →
+5. **Publish the app:** on the OAuth consent screen set **Publishing status →
+   In production**. ⚠️ **This is the single most important step for unattended
+   uploads.** While the app is in *Testing*, Google **expires its refresh token
+   after 7 days** — which is exactly why uploads start failing every few days
+   with `invalid_grant: Token has been expired or revoked`. Publishing to
+   production makes the refresh token long-lived. (Going to production may
+   require Google's app-verification for the sensitive YouTube scopes; for your
+   own single-account use, adding yourself as a test user *and* publishing is
+   normally enough to keep the token alive.)
+6. **Credentials → Create OAuth client ID → Desktop app** → download JSON →
    save as `auth/client_secret.json`
 
 ### 1.4 Install & authorize
@@ -127,6 +136,58 @@ token is missing, revoked, unreadable, or missing scopes, the bot still starts
 reauthorization is needed and says to run `python scripts/youtube_auth.py
 --force` **on the host**, then restart the container. (Remember: an API key
 alone cannot upload videos — that is what this OAuth refresh token is for.)
+
+### Automatic token refresh (no more re-auth every few days)
+
+YouTube **access** tokens live ~1 hour, but the **refresh** token is long-lived
+*once the OAuth app is in production* (see §1.3 step 5). The agent never asks
+you to log in again for a normal expiry:
+
+* **Proactive refresh** — before every authenticated call the token is renewed
+  if it has expired *or* expires within `YOUTUBE_REFRESH_LEEWAY_MINUTES`
+  (default 10), so a long upload can't die mid-transfer.
+* **Persisted atomically** — refreshed credentials are written to
+  `data/tokens/youtube_token.json` via a temp-file + rename with `600`
+  permissions, so they survive restarts and AWS reboots (the file is on the
+  `./data` bind mount).
+* **Background keep-alive** — a background task renews the token every ~45 min
+  even when no Short is published, and surfaces a *revoked* token within the
+  hour instead of at publish time.
+* **Errors are classified** — a `invalid_grant` rejection (revoked / 7-day
+  testing expiry) is reported to Telegram with the exact recovery steps, while
+  a network blip while refreshing is retried and *never* mistaken for a dead
+  token. Repeated auth alerts are time-deduplicated (one notice per problem per
+  6 h), and you get a confirmation when it recovers on its own.
+
+> **If you still see `invalid_grant: Token has been expired or revoked`**, the
+> refresh token is genuinely dead — almost always because the OAuth app is in
+> *Testing* (7-day expiry) or the token was revoked. Publish the consent screen
+> to **In production**, then run `python scripts/youtube_auth.py --force` on the
+> host and restart the container. The agent will then keep renewing it by itself.
+
+### Text overlay on Shorts (FFmpeg drawtext)
+
+Burn a one-line caption directly onto the video before it is uploaded. Driven
+by the Gemini analysis, rendered with FFmpeg's `drawtext` filter.
+
+* **FFmpeg** is baked into the Docker image (`ffmpeg` + `fonts-dejavu-core`); on
+  a bare host install it with `apt-get install ffmpeg fonts-dejavu-core`, or set
+  `FFMPEG_PATH`/`FFPROBE_PATH`/`OVERLAY_FONT` in `.env`.
+* **Mode A/C — no text given:** the agent watches the clip and proposes **3**
+  content-aware one-line captions. Tap **1 / 2 / 3**, type your own, or **Skip**.
+  A `CAPTION_TIMEOUT_MINUTES` (default 15) timer auto-continues *without* an
+  overlay if you don't reply, so a video is never stuck waiting.
+* **Mode B — your exact text:** send the video with a caption like
+  `Add this text: "Nobody expected this to happen!"` (also `overlay:`, `text:`,
+  `caption:`, or a quoted string). Your wording is used verbatim.
+* **Safe rendering:** font size and word-wrap scale to the frame, white text
+  with a black outline + drop shadow stays readable over any background, audio
+  is copied bit-for-bit (no re-encode, no drift), aspect ratio and resolution
+  are preserved, and all temporary files are cleaned up. If overlay rendering
+  fails (e.g. no font, no FFmpeg), the agent **tells you and continues with the
+  original video** — it never loses the publish.
+* Works for both **immediate** and **scheduled** uploads, and the burned-in
+  caption is shown on the review card.
 
 **Upgrading from the previous named-volume setup** — the old compose file
 shadowed `./data` with the Docker volume `shorts-data`, which is exactly why
@@ -265,5 +326,7 @@ Send a Short and **say what to do in the caption**:
 - **Different daily goal** → `DAILY_SHORT_GOAL=3` in `.env`
 - **Different report day** → `WEEKLY_REPORT_WEEKDAY` (0=Mon … 6=Sun)
 - **Auto-publish, skip review** → send videos with the caption *"upload now"*
-- **Thumbnails / burned-in captions / multi-channel** → extend `agent/publish.py`
+- **Burned-in text captions** → now built-in (see §"Text overlay on Shorts"); tune via
+  `TEXT_OVERLAY_ENABLED`, `CAPTION_TIMEOUT_MINUTES`, `OVERLAY_FONT`
+- **Thumbnails / multi-channel** → extend `agent/publish.py`
 - **Other research sources** → add a fetcher in `agent/research.py` (respect rate limits)

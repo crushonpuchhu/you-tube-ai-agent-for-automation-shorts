@@ -60,8 +60,7 @@ CATEGORIES = {
 }
 
 SYSTEM_PROMPT = """\
-You are a YouTube Shorts growth strategist and viral content analyst.
-You will receive a short vertical video. Watch it AND listen to its audio, then write
+You are a YouTube Shorts growth strategist and viral content analyst.You will receive a short vertical video. Watch it AND listen to its audio, then write
 the complete metadata package that gives the upload the best chance of going viral.
 
 Return ONLY a raw JSON object (no markdown fences, no commentary) with exactly these keys:
@@ -125,6 +124,66 @@ class VideoAnalyzer:
         text = await asyncio.to_thread(self._generate_with_retry, file_ref, prompt)
         log.info("Gemini raw response (%d chars): %s", len(text), text[:400])
         return self._parse(text)
+
+    # ------------------------------------------------------- overlay captions
+    async def suggest_captions(self, video_path: Path, hint: str = "",
+                               count: int = 3) -> list[str]:
+        """Watch the clip and return `count` one-line overlay captions (Mode A/C).
+
+        Reuses the same upload + retry plumbing as `analyze`. The captions are
+        content-aware (subject, mood, language of the audio) and kept short so
+        they stay legible when burned onto a 9:16 frame. Never raises for a
+        caption problem the caller cannot control — returns [] on any failure
+        so the Telegram flow can fall back to "no overlay".
+        """
+        try:
+            file_ref = await asyncio.to_thread(self._upload, video_path)
+            file_ref = await asyncio.to_thread(self._wait_until_active, file_ref)
+        except Exception as exc:  # noqa: BLE001 - captions are best-effort
+            log.warning("Caption suggestion skipped (upload failed): %s", str(exc)[:200])
+            return []
+
+        prompt = (
+            "You will receive a short vertical video. Watch it AND listen to its audio.\n"
+            f"Return ONLY a raw JSON object: {{\"captions\": [\"...\", \"...\"]}}\n"
+            f"Provide exactly {count} DISTINCT one-line overlay captions for a text "
+            "overlay burned onto the video.\n"
+            "Rules:\n"
+            "- Each caption is ONE line, at most 45 characters, punchy and attention-grabbing.\n"
+            "- Match the video's subject, mood and the language actually spoken "
+            "(Hinglish stays Hinglish, Hindi stays Hindi, English stays English).\n"
+            "- They must fit the content naturally — no misleading claims, no fake "
+            "\"you won't believe\" spam that has nothing to do with the clip.\n"
+            "- No hashtags, no emoji, no quotation marks inside the captions.\n"
+            "- Think about the opening seconds and what makes a viewer keep watching.\n"
+        )
+        if hint and hint.strip():
+            prompt += f'\nCreator context: "{hint.strip()}"\n'
+        prompt += "\nReturn the JSON object now."
+
+        try:
+            text = await asyncio.to_thread(self._generate_with_retry, file_ref, prompt)
+            data = _json_loads_best_effort(text)
+            captions = data.get("captions") if isinstance(data, dict) else None
+            if not captions and isinstance(data, list):
+                captions = data
+            cleaned: list[str] = []
+            for item in captions or []:
+                line = str(item).strip().strip('"“”')
+                line = " ".join(line.split())
+                if not line:
+                    continue
+                if len(line) > 60:
+                    line = line[:57].rstrip() + "…"
+                if line not in cleaned:
+                    cleaned.append(line)
+                if len(cleaned) >= count:
+                    break
+            log.info("Generated %d overlay captions for %s", len(cleaned), video_path.name)
+            return cleaned
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log.warning("Caption suggestion failed: %s", str(exc)[:200])
+            return []
 
     def _generate_with_retry(self, file_ref, prompt: str) -> str:
         """Call Gemini, retrying while it is overloaded.

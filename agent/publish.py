@@ -130,6 +130,7 @@ class Publisher:
 
         stamp = now_iso()
         url = f"https://youtu.be/{youtube_id}"
+        refreshed = self.uploader.consume_refresh_flag()
         self.db.update_video(
             video_row_id,
             status=STATUS_PUBLISHED,
@@ -154,7 +155,12 @@ class Publisher:
 
         # Notify only if this wasn't an interactive (in-chat) upload.
         self.goal.check()  # fires the "target achieved" notice when appropriate
-        return self.db.get_video(video_row_id)
+        record = self.db.get_video(video_row_id)
+        # Surfaced in the Telegram message: the owner learns that a publish
+        # succeeded *after* the agent had to renew the token by itself.
+        if record is not None:
+            record["token_refreshed"] = refreshed
+        return record
 
     def publish_and_notify(self, video_row_id: int) -> dict:
         """Used by the scheduler: always reports the outcome to Telegram."""
@@ -165,7 +171,8 @@ class Publisher:
         except AuthRequired as exc:
             self.notifier.send(
                 f"🔐 <b>YouTube authorization needed</b>\n\n{exc}\n\n"
-                f"The scheduled Short <i>{title}</i> was NOT published."
+                f"The scheduled Short <i>{title}</i> was NOT published. The agent has "
+                "recorded the error and needs authentication recovery."
             )
             raise
         except Exception as exc:  # noqa: BLE001
@@ -195,6 +202,11 @@ class Publisher:
             lines.append(
                 "⚠️ Confirmed by the upload API; full verification pending — "
                 "run <code>python scripts/youtube_auth.py --force</code>"
+            )
+        if record.get("token_refreshed"):
+            lines.append(
+                "🔁 YouTube auth had expired — the agent refreshed the token "
+                "automatically and the upload continued."
             )
         lines.append(f"🎯 Daily goal: {goal_line}")
         self.notifier.send("\n".join(lines))

@@ -17,6 +17,31 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata ffmpeg fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
+# ---------------------------------------------------------------------------
+# Deno — the JavaScript runtime yt-dlp needs to download from YouTube.
+#
+# Since yt-dlp moved to EJS, YouTube's "n" challenge must be solved by an
+# external JS runtime. Without one yt-dlp answers "Only images are available
+# for download" and every source download dies with "Requested format is not
+# available" — which looked like a cookies/bot-check problem but was not.
+# yt-dlp looks for `deno` on PATH and enables it by default (>= 2.3.0).
+# The official denoland/deno:bin image is empty, so the release binary is
+# fetched here instead. Pin DENO_VERSION to keep builds reproducible.
+# ---------------------------------------------------------------------------
+ARG DENO_VERSION=2.9.8
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) deno_arch=x86_64-unknown-linux-gnu ;; \
+        arm64) deno_arch=aarch64-unknown-linux-gnu ;; \
+        *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    python -c "import io, os, sys, urllib.request, zipfile; \
+url = 'https://github.com/denoland/deno/releases/download/v' + sys.argv[1] + '/deno-' + sys.argv[2] + '.zip'; \
+data = urllib.request.urlopen(url, timeout=180).read(); \
+zipfile.ZipFile(io.BytesIO(data)).extractall('/usr/local/bin'); \
+os.chmod('/usr/local/bin/deno', 0o755)" "$DENO_VERSION" "$deno_arch"; \
+    deno --version
+
 # PYTHONUNBUFFERED makes `docker logs -f` show output immediately; otherwise
 # Python buffers stdout and the terminal looks frozen until it exits.
 #

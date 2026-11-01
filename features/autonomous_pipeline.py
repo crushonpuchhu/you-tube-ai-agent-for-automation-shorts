@@ -565,22 +565,42 @@ def run_autonomous_cycle(deps: PipelineDeps, *, manual: bool = False) -> CycleRe
             if ctx.generated >= ctx.remaining or ctx.generated >= remaining:
                 break
             topic_text = str(topic.get("topic") or "")
-            candidates: list[dict] = []
-            if aconf.youtube_discovery_enabled:
-                candidates = search_youtube_long_videos(
-                    topic_text,
+            # A full news headline returns no videos from YouTube search; use
+            # the short keyword query built at research time instead.
+            search_query = str(topic.get("search_query") or topic_text).strip()
+            language_code = (
+                "en"
+                if aconf.channel_language.lower().startswith("en")
+                else aconf.channel_language.lower()[:2]
+            )
+
+            def _search(query: str) -> list[dict]:
+                return search_youtube_long_videos(
+                    query,
                     niche_state.value,
                     min_duration_minutes=aconf.youtube_min_source_video_minutes,
                     max_duration_minutes=aconf.max_source_video_minutes,
                     result_limit=aconf.youtube_search_results_per_topic,
                     youtube=deps.youtube,
                     region=aconf.channel_region,
-                    language=(
-                        "en" if aconf.channel_language.lower().startswith("en")
-                        else aconf.channel_language.lower()[:2]
-                    ),
+                    language=language_code,
                     lookback_hours=aconf.youtube_source_lookback_hours,
                     license=aconf.youtube_search_license,
+                )
+
+            candidates: list[dict] = []
+            if aconf.youtube_discovery_enabled:
+                candidates = _search(search_query)
+                if not candidates and search_query.lower() != niche_state.value.lower():
+                    log.info(
+                        "No source for query %r; retrying with the niche", search_query
+                    )
+                    candidates = _search(niche_state.value)
+                log.info(
+                    "Topic %r → query %r → %d candidate(s)",
+                    topic_text[:60],
+                    search_query,
+                    len(candidates),
                 )
 
             eligible, rejected = discover_sources(
@@ -631,7 +651,12 @@ def run_autonomous_cycle(deps: PipelineDeps, *, manual: bool = False) -> CycleRe
                 deps,
                 "🤖 <b>Autonomous cycle finished</b>\n\nNo eligible source was "
                 "processed. "
-                f"{rejected_count} candidate(s) failed the rights gate."
+                + (
+                    f"{rejected_count} candidate(s) failed the rights gate."
+                    if rejected_count
+                    else "YouTube search returned no usable Creative Commons "
+                    "video for what it looked for."
+                )
                 + (f"\n\n<b>Why sources were skipped</b>\n{_skip_summary(result.skipped)}" if result.skipped else "")
                 + "\n\n<b>How to fix</b>\n"
                 "· Add long videos (5 min+) to <code>data/autonomous_sources/</code> "

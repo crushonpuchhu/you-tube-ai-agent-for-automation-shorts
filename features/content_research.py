@@ -81,6 +81,11 @@ class ResearchTopic:
     kind: str = "evergreen"
     niche: str = ""
     discovered_at: str = ""
+    # Short Latin-script query used for the YouTube source search. A full
+    # Hindi news headline ("Tech Tips: फोन चार्जर पर लिखा R कोड…") returns
+    # ZERO videos on YouTube search; "tech tips" or "charger code" returns
+    # several. Empty means "fall back to the niche".
+    search_query: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -97,6 +102,7 @@ class ResearchTopic:
             "kind": self.kind,
             "niche": self.niche,
             "discovered_at": self.discovered_at or now_ist().isoformat(),
+            "search_query": self.search_query,
         }
 
 
@@ -131,6 +137,9 @@ def _normalise_topic(raw: dict, niche: str) -> dict | None:
         kind=str(raw.get("kind") or "evergreen").lower(),
         niche=niche,
         discovered_at=now_ist().isoformat(),
+        search_query=" ".join(
+            str(raw.get("search_query") or build_youtube_query(topic, niche)).split()
+        )[:120],
     ).to_dict()
 
 
@@ -174,6 +183,49 @@ def _niche_tokens(niche: str) -> set[str]:
         for token in re.split(r"[^a-z0-9]+", (niche or "").lower())
         if len(token) > 2
     }
+
+
+# "Title - Site name" decorations that only add noise to a YouTube search.
+# A leading "Tech Tips:" label is kept on purpose: those words are exactly the
+# Latin-script keywords that make the query searchable.
+_SITE_SUFFIX = re.compile(r"\s+[-–—|]\s+[^-–—|]{2,60}$")
+_LATIN_WORD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+#&'-]*$")
+
+
+def build_youtube_query(title: str, niche: str = "", max_words: int = 3) -> str:
+    """Turn a headline into a short query YouTube search can actually answer.
+
+    Google News returns full sentences, often in Devanagari. YouTube search
+    returns no videos for those (verified against the live API), but does
+    return several for the few Latin-script keywords inside them ("tech
+    tips", "charger code"). Falls back to one niche segment when the headline
+    has no usable Latin words.
+    """
+    text = " ".join(str(title or "").split())
+    text = _SITE_SUFFIX.sub("", text)
+    text = re.sub(r"[…\"“”‘’|/\\()\[\]]", " ", text)
+
+    latin: list[str] = []
+    for word in text.split():
+        cleaned = word.strip(",.!?;:-")
+        # Two-letter words count: "AI", "QR", "3D" are the meaningful ones.
+        if len(cleaned) >= 2 and _LATIN_WORD.match(cleaned):
+            latin.append(cleaned)
+        if len(latin) >= max_words:
+            break
+
+    if len(latin) >= 2:
+        return " ".join(latin)[:120]
+
+    first_segment = next(
+        (
+            " ".join(segment.split())
+            for segment in re.split(r"[,;|]", niche or "")
+            if segment.strip()
+        ),
+        "",
+    )
+    return (first_segment or " ".join(latin))[:120]
 
 
 def _google_locale(region: str, language: str) -> tuple[str, str]:
@@ -257,6 +309,7 @@ def google_topic_candidates(
                 score,
                 {
                     "topic": topic_text,
+                    "search_query": build_youtube_query(topic_text, niche),
                     "why_now": f"Surfaced by Google Search / News for {niche!r}.",
                     "audience": f"{language} speakers in {geo}",
                     "evidence": f"{title} — {link}",

@@ -8,4 +8,7 @@ google-auth-httplib2==0.2.0
 rich==15.0.0
 # [AUTONOMOUS-FITNESS-V2] Optional, lazily imported: only used when the owner
 # explicitly enables remote source downloads (AUTONOMOUS_ALLOW_DOWNLOAD=true).
-yt-dlp>=2024.1.1
+# The `default` extra pulls in yt-dlp-ejs, the challenge-solver scripts yt-dlp
+# runs under Deno (installed earlier in this Dockerfile). Without it YouTube
+# downloads fail with "Only images are available for download".
+yt-dlp[default]>=2024.1.1

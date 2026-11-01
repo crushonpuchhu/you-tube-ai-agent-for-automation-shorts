@@ -112,6 +112,19 @@ YTDLP_COOKIEFILE=/app/data/cookies.txt
 Everything else is skipped with a logged reason. Public visibility, view count,
 search ranking and manual approval are **not** permission.
 
+**Downloads also need a JavaScript runtime (Deno).** yt-dlp solves YouTube's
+"n" challenge with the external `yt-dlp-ejs` scripts, so the image installs
+Deno (`DENO_VERSION` build arg) and `yt-dlp[default]`. Without them yt-dlp
+answers *"Only images are available for download"* and every download fails
+with *"Requested format is not available"* — which looks exactly like a
+bot-check problem but is not.
+
+**Topic headlines are not search queries.** Google returns full sentences,
+often in Devanagari, and YouTube search returns **zero** videos for those. Each
+topic carries a short `search_query` built from the Latin-script keywords in
+the headline ("Tech Tips QR"), and the cycle falls back to the niche itself
+when that still finds nothing.
+
 ---
 
 ## 3. Commands

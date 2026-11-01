@@ -320,7 +320,11 @@ async def _run_manual_cycle(context: ContextTypes.DEFAULT_TYPE, deps: Any) -> No
     from features.autonomous_pipeline import run_autonomous_cycle
 
     try:
-        result = await asyncio.to_thread(run_autonomous_cycle, deps, True)
+        # run_autonomous_cycle takes `manual` as keyword-only; passing it
+        # positionally raised TypeError and killed every /autopilot_run.
+        result = await asyncio.to_thread(
+            lambda: run_autonomous_cycle(deps, manual=True)
+        )
         log.info("Manual autonomous cycle result: %s", result.summary())
     except Exception:  # noqa: BLE001 - the pipeline already notifies failures
         log.exception("Manual autonomous cycle failed")

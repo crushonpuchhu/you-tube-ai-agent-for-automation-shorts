@@ -126,6 +126,7 @@ search ranking and manual approval are **not** permission.
 | `/autopilot_run` | Run one cycle now (background; result/cards arrive in chat). |
 | `/autopilot_review` | List candidates waiting for approval. |
 | `/autopilot_add_source` | Reply to (or caption) a long video you own: stores it as owner media with a rights sidecar. |
+| `/autopilot_cookies` | Reply to an uploaded `cookies.txt` (Netscape format) to let yt-dlp download from the server. |
 
 Only the owner can use them: `AUTOPILOT_OWNER_IDS` if set, otherwise
 `TELEGRAM_CHAT_ID` / the persisted `owner_chat_id`.

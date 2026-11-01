@@ -681,6 +681,112 @@ async def cmd_autopilot_add_source(
     )
 
 
+# ------------------------------------------------------------- cookie jar
+def cookie_jar_status(text: str) -> tuple[bool, str]:
+    """Check that an uploaded file really is a Netscape cookies.txt with YouTube."""
+    if not (text or "").strip():
+        return False, "File is empty."
+    rows = [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not rows:
+        return False, "No cookie lines found."
+    youtube_rows = [row for row in rows if "youtube.com" in row]
+    if not youtube_rows:
+        return False, "No youtube.com cookies in this file."
+    if any(len(row.split("\t")) < 6 for row in youtube_rows):
+        return (
+            False,
+            "Cookie lines are not in Netscape cookies.txt format. "
+            "Export with the 'Get cookies.txt LOCALLY' extension.",
+        )
+    return True, f"{len(youtube_rows)} youtube.com cookie line(s)"
+
+
+async def cmd_autopilot_cookies(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Store an uploaded cookies.txt so yt-dlp can download on the server."""
+    if not is_owner(update, context):
+        await _deny(update)
+        return
+
+    message = update.effective_message
+    document = getattr(message, "document", None) or getattr(
+        getattr(message, "reply_to_message", None), "document", None
+    )
+    if document is None:
+        await message.reply_text(
+            "🍪 <b>Upload YouTube cookies</b>\n\n"
+            "1. Install the browser extension <b>Get cookies.txt LOCALLY</b>.\n"
+            "2. Open youtube.com while signed in and click the extension → "
+            "<b>Export</b> (Netscape format).\n"
+            "3. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
+            "then reply to it with <code>/autopilot_cookies</code>.\n\n"
+            "This only fixes downloads; nothing is published without your approval.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    size = int(getattr(document, "file_size", 0) or 0)
+    if size > 2 * 1024 * 1024:
+        await message.reply_text("❌ File is larger than 2 MB; that is not a cookie jar.")
+        return
+
+    status = await message.reply_text("🍪 Checking the cookie file…")
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        raw = bytes(await tg_file.download_as_bytearray())
+        ok, detail = cookie_jar_status(raw.decode("utf-8", errors="replace"))
+        if not ok:
+            await status.edit_text(f"❌ {html.escape(detail)}")
+            return
+
+        from config import DATA_DIR
+
+        target = Path(DATA_DIR) / "cookies.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".txt.tmp")
+        temporary.write_bytes(raw)
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        temporary.replace(target)
+    except Exception as exc:  # noqa: BLE001 - report instead of crashing
+        log.exception("Cookie jar ingest failed")
+        await status.edit_text(
+            f"❌ Could not store cookies: <code>{html.escape(str(exc)[:300])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # The config and the pipeline dependencies are cached per process; drop
+    # them so the next cycle sees the new cookie jar.
+    try:
+        context.application.bot_data.pop("autonomous_cfg", None)
+        scheduler = context.application.bot_data.get("scheduler")
+        if scheduler is not None:
+            for attr in ("_autonomous_config", "_autonomous_deps"):
+                if hasattr(scheduler, attr):
+                    setattr(scheduler, attr, None)
+    except Exception:  # noqa: BLE001 - cache invalidation is best effort
+        log.exception("Could not refresh autonomous config after cookie upload")
+
+    await status.edit_text(
+        "✅ <b>Cookies stored</b>\n\n"
+        f"🍪 {html.escape(detail)}\n"
+        f"📁 <code>{html.escape(str(target))}</code>\n\n"
+        "YouTube downloads should work from the next cycle. Run "
+        "<code>/autopilot_run</code> to test now.\n"
+        "Treat this file like a password — delete it and re-export if you "
+        "change your Google password.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ------------------------------------------------------------------ registration
 def register_autonomous_handlers(app: Application) -> None:
     """Register the additive commands and the ``af:`` callback namespace."""
@@ -693,6 +799,7 @@ def register_autonomous_handlers(app: Application) -> None:
     app.add_handler(
         CommandHandler("autopilot_add_source", cmd_autopilot_add_source)
     )
+    app.add_handler(CommandHandler("autopilot_cookies", cmd_autopilot_cookies))
     # Pattern-restricted, registered BEFORE the existing generic callback
     # handler by the caller: no existing callback payload can reach it.
     app.add_handler(CallbackQueryHandler(handle_autonomous_callback, pattern=r"^af:"))

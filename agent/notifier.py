@@ -86,3 +86,63 @@ class Notifier:
     def send_many(self, messages: Iterable[str], chat_id: int | None = None) -> None:
         for message in messages:
             self.send(message, chat_id=chat_id)
+
+    # [AUTONOMOUS-FITNESS-V2] Additive rich notifications. Existing methods
+    # above are untouched; these only add optional reply markup / video preview
+    # support used by the new autonomous approval cards.
+    def send_markup(self, text: str, reply_markup=None,
+                    chat_id: int | None = None) -> bool:
+        """Send an HTML message with inline buttons from any thread."""
+        target = chat_id or self._default_chat_id
+        if not self._app or not self._loop or not target:
+            log.warning("Notifier not ready (chat_id=%s); markup message dropped",
+                        target)
+            return False
+        asyncio.run_coroutine_threadsafe(
+            self._send_markup_async(target, text, reply_markup), self._loop
+        )
+        return True
+
+    async def _send_markup_async(self, chat_id: int, text: str, reply_markup) -> None:
+        from telegram.constants import ParseMode
+
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:  # noqa: BLE001 - notifications must never crash
+            log.warning("Telegram markup notify failed: %s", exc)
+
+    def send_video_preview(self, video_path, caption: str = "",
+                           chat_id: int | None = None) -> bool:
+        """Send a local clip as a best-effort preview from any thread."""
+        from pathlib import Path
+
+        target = chat_id or self._default_chat_id
+        path = Path(video_path)
+        if not self._app or not self._loop or not target or not path.is_file():
+            return False
+        try:
+            if path.stat().st_size > 49 * 1024 * 1024:  # Telegram bot API limit
+                log.info("Preview skipped: %s is larger than 49 MB", path.name)
+                return False
+        except OSError:
+            return False
+        asyncio.run_coroutine_threadsafe(
+            self._send_video_async(target, path, caption), self._loop
+        )
+        return True
+
+    async def _send_video_async(self, chat_id: int, path, caption: str) -> None:
+        from telegram.constants import ParseMode
+
+        try:
+            with open(path, "rb") as handle:
+                await self._app.bot.send_video(
+                    chat_id=chat_id, video=handle,
+                    caption=(caption or "")[:1024],
+                    parse_mode=ParseMode.HTML, supports_streaming=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - preview is optional
+            log.warning("Telegram video preview failed: %s", exc)

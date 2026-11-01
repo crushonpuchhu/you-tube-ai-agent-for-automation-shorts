@@ -1290,6 +1290,34 @@ def build_application(cfg: Config) -> Application:
         "overlay": TextOverlayEngine(cfg),
     })
 
+    # [AUTONOMOUS-FITNESS-V2] Additive autonomous feature wiring. All flags
+    # default to OFF; if anything here fails the existing bot still starts.
+    try:
+        from features.autonomous_config import AutonomousConfig
+        from features.job_store import JobStore
+
+        _aconf = AutonomousConfig.load(cfg)
+        app.bot_data["autonomous_cfg"] = _aconf
+        app.bot_data["autonomous_store"] = JobStore(cfg.db_path)
+        # Share the already-created analyzer / LLM / research engine with the
+        # scheduler-driven autonomous worker (no second clients or scopes).
+        scheduler.feature_analyzer = app.bot_data["analyzer"]
+        scheduler.feature_llm = llm
+        scheduler.feature_research = research
+        # Share the same store/config instances so the scheduler bridge never
+        # opens a second database handle or re-reads the environment.
+        scheduler._autonomous_config = _aconf
+        scheduler._autonomous_store = app.bot_data["autonomous_store"]
+        log.info(
+            "Autonomous features: content=%s scheduler=%s unattended=%s discovery=%s",
+            _aconf.enabled,
+            _aconf.scheduler_enabled,
+            _aconf.unattended_publish,
+            _aconf.youtube_discovery_enabled,
+        )
+    except Exception:  # noqa: BLE001 - existing functionality must survive
+        log.exception("Autonomous feature wiring failed — bot continues unchanged")
+
     app.add_handler(TypeHandler(Update, _capture_chat), group=-1)
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
@@ -1318,6 +1346,16 @@ def build_application(cfg: Config) -> Application:
             receive_video,
         )
     )
+    # [AUTONOMOUS-FITNESS-V2] Additive commands + the `af:` callback namespace.
+    # Registered BEFORE the generic callback handler and pattern-restricted, so
+    # no existing callback payload can ever reach the autonomous handler.
+    try:
+        from features.telegram_autonomous_hooks import register_autonomous_handlers
+
+        register_autonomous_handlers(app)
+    except Exception:  # noqa: BLE001 - existing bot must start unchanged
+        log.exception("Autonomous Telegram handlers not registered — bot continues unchanged")
+
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(handle_error)

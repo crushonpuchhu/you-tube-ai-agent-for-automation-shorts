@@ -164,6 +164,14 @@ class Scheduler:
                                  dedupe_key=f"weekly:{upcoming.strftime('%Y-%m-%d')}",
                                  max_attempts=2)
 
+        # [AUTONOMOUS-FITNESS-V2] Additive autonomous scheduling hook. Returns
+        # immediately when ENABLE_AUTONOMOUS_CONTENT / _SCHEDULER are false.
+        try:
+            from features.autonomous_scheduler import ensure_autonomous_tasks
+            ensure_autonomous_tasks(self)
+        except Exception:  # noqa: BLE001 - never break existing scheduling
+            log.exception("Autonomous scheduling hook failed")
+
     # ------------------------------------------------------------ scheduling
     def schedule_video(self, video_row_id: int, run_at_iso: str) -> int | None:
         """Persist a scheduled publish. Survives restarts by design."""
@@ -272,6 +280,17 @@ class Scheduler:
             from agent import cleanup
             from config import VIDEO_DIR
             cleanup.sweep(self.db, VIDEO_DIR, self.cfg.video_retention_days)
+            return
+
+        # [AUTONOMOUS-FITNESS-V2] Additive autonomous task dispatch hook.
+        # The prefix cannot collide with any task kind created by the existing
+        # scheduler, so behavior is unchanged when the feature is OFF.
+        if kind.startswith("autonomous_"):
+            try:
+                from features.autonomous_scheduler import handle_autonomous_task
+                handle_autonomous_task(self, task)
+            except Exception:  # noqa: BLE001 - existing task loop must survive
+                log.exception("Autonomous task %s failed", task.get("id"))
             return
 
         log.warning("Unknown task kind: %s", kind)

@@ -6,3 +6,6 @@ google-auth==2.38.0
 google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 rich==15.0.0
+# [AUTONOMOUS-FITNESS-V2] Optional, lazily imported: only used when the owner
+# explicitly enables remote source downloads (AUTONOMOUS_ALLOW_DOWNLOAD=true).
+yt-dlp>=2024.1.1

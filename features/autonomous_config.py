@@ -106,6 +106,7 @@ class AutonomousConfig:
 
     # ---- research / discovery ------------------------------------------
     research_lookback_hours: int
+    research_use_google: bool
     youtube_source_lookback_hours: int
     youtube_min_source_video_minutes: int
     max_source_video_minutes: int
@@ -188,6 +189,9 @@ class AutonomousConfig:
             publish_times_ist=times,
             bot_timezone=_env("BOT_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata",
             research_lookback_hours=max(1, _int("RESEARCH_LOOKBACK_HOURS", 72)),
+            # Google News/Trends RSS topic search (keyless). Falls back to the
+            # existing research engine when it returns nothing.
+            research_use_google=_bool("RESEARCH_USE_GOOGLE_SEARCH", True),
             # Source discovery deliberately does NOT reuse the 72h research
             # window: usable long-form sources are evergreen, and a 3-day
             # filter would reject almost every Creative Commons candidate.

@@ -536,6 +536,7 @@ def run_autonomous_cycle(deps: PipelineDeps, *, manual: bool = False) -> CycleRe
             llm=deps.llm,
             limit=min(aconf.max_topics_per_cycle, max(1, remaining)),
             content_mix=aconf.content_mix,
+            google_search=aconf.research_use_google,
         )
         result.topics = len(topics)
         if not topics:

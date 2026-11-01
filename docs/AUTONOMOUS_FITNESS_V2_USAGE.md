@@ -26,6 +26,19 @@ pending candidates.
 > `ENABLE_AUTONOMOUS_SCHEDULER=false` is useful for testing: you can still run a
 > cycle manually with `/autopilot_run`.
 
+### Topic discovery — Google first
+
+Each cycle asks **Google** for topics before falling back to the existing
+research engine (`RESEARCH_USE_GOOGLE_SEARCH=true`):
+
+1. Google News RSS for the niche (and for each comma-separated niche segment).
+2. Google Trends RSS for `CHANNEL_REGION`.
+3. Headlines that share no keyword with the niche are dropped, so a trending
+   cricket score never becomes a Short.
+
+This uses Google's public RSS endpoints, not the Gemini `google_search`
+grounding tool (that tool answers HTTP 429 on API tiers that do not include it).
+
 ---
 
 ## 2. Give it a permitted source

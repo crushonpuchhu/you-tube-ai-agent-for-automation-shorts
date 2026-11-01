@@ -15,12 +15,23 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any
 
 from agent.clock import now_ist
 
 log = logging.getLogger(__name__)
+
+# Keyless Google endpoints. Gemini's `google_search` grounding tool is not
+# available on every API tier (it answers 429 for some plans), but these RSS
+# feeds are public, stable and reachable from a cloud IP.
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+GOOGLE_TRENDS_RSS = "https://trends.google.com/trending/rss"
+_UA = "Mozilla/5.0 (compatible; ShortsAgent/1.0; +https://github.com)"
 
 RESEARCH_PROMPT = """\
 You are the research planner for a YouTube Shorts channel.
@@ -135,6 +146,140 @@ def _dedupe(topics: list[dict]) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------- Google web search
+def _fetch_rss(url: str, timeout: int = 15) -> list[dict]:
+    """Fetch and parse an RSS feed into simple dicts (never raises)."""
+    request = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        payload = response.read()
+    root = ET.fromstring(payload)
+    items: list[dict] = []
+    for item in root.findall(".//item"):
+        items.append(
+            {
+                "title": " ".join((item.findtext("title") or "").split()),
+                "link": (item.findtext("link") or "").strip(),
+                "published": (item.findtext("pubDate") or "").strip(),
+                "description": " ".join(
+                    (item.findtext("description") or "").split()
+                )[:400],
+            }
+        )
+    return items
+
+
+def _niche_tokens(niche: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", (niche or "").lower())
+        if len(token) > 2
+    }
+
+
+def _google_locale(region: str, language: str) -> tuple[str, str]:
+    geo = (region or "IN").upper()[:2]
+    lang = (language or "Hindi").lower()
+    code = "hi" if lang.startswith("hi") else "en"
+    return f"{code}-{geo}", geo
+
+
+def google_topic_candidates(
+    niche: str,
+    region: str = "IN",
+    language: str = "Hindi",
+    limit: int = 3,
+    *,
+    fetcher: Any = None,
+    include_trends: bool = True,
+) -> list[dict]:
+    """Google-sourced topic candidates (Google News RSS + Google Trends RSS).
+
+    Only items that share a keyword with the niche are kept, so a trending
+    cricket score never becomes a coding Short. Every returned topic carries
+    the article URL as ``evidence``, which the pipeline requires.
+    """
+    fetch = fetcher or _fetch_rss
+    niche = " ".join((niche or "").split()) or "fitness"
+    tokens = _niche_tokens(niche)
+    hl, geo = _google_locale(region, language)
+
+    raw_items: list[dict] = []
+    queries: list[str] = [niche]
+    for segment in re.split(r"[,;|]", niche):
+        segment = " ".join(segment.split())
+        if segment and segment.lower() not in {q.lower() for q in queries}:
+            queries.append(segment)
+    for query in queries[:3]:
+        news_url = (
+            f"{GOOGLE_NEWS_RSS}?"
+            + urllib.parse.urlencode(
+                {
+                    "q": query,
+                    "hl": f"{hl}",
+                    "gl": geo,
+                    "ceid": f"{geo}:{hl.split('-')[0]}",
+                }
+            )
+        )
+        try:
+            raw_items.extend(fetch(news_url))
+        except Exception as exc:  # noqa: BLE001 - research must never crash the bot
+            log.warning("Google News fetch failed for %r: %s", query, str(exc)[:160])
+
+    if include_trends:
+        try:
+            raw_items.extend(
+                fetch(f"{GOOGLE_TRENDS_RSS}?{urllib.parse.urlencode({'geo': geo})}")
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Google Trends fetch failed: %s", str(exc)[:200])
+
+    scored: list[tuple[int, dict]] = []
+    seen_titles: set[str] = set()
+    for item in raw_items:
+        title = " ".join(str(item.get("title") or "").split())
+        link = str(item.get("link") or "").strip()
+        if not title or not link:
+            continue
+        haystack = f"{title} {item.get('description') or ''}".lower()
+        hits = sum(1 for token in tokens if token in haystack)
+        if tokens and hits == 0:
+            continue  # off-niche trend (sports, politics, celebrity)
+        key = title.lower()
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+
+        score = min(85, 45 + hits * 10)
+        topic_text = title if len(title) <= 120 else title[:117].rstrip() + "…"
+        scored.append(
+            (
+                score,
+                {
+                    "topic": topic_text,
+                    "why_now": f"Surfaced by Google Search / News for {niche!r}.",
+                    "audience": f"{language} speakers in {geo}",
+                    "evidence": f"{title} — {link}",
+                    "hook": "",
+                    "format": "talking head / demo",
+                    "sources": [link],
+                    "priority_score": score,
+                    "confidence": "medium",
+                    "limitations": "Headline relevance only; verify before recording.",
+                    "kind": "trending",
+                },
+            )
+        )
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    log.info(
+        "Google search: %d niche-matched topic(s) from %d result(s)",
+        len(scored),
+        len(raw_items),
+    )
+    return [item for _, item in scored[: max(1, int(limit))]]
+
+
 def research_topics(
     niche: str,
     region: str,
@@ -145,15 +290,42 @@ def research_topics(
     llm: Any = None,
     limit: int = 5,
     content_mix: str = "70% trending, 30% evergreen educational",
+    google_search: bool = False,
+    google_fetcher: Any = None,
 ) -> list[dict]:
     """Return evidence-backed topic candidates (never raises).
 
     ``engine`` is the existing ``agent.research.ResearchEngine`` instance and
     ``llm`` the existing ``agent.llm.LLM`` instance.  Both are optional so the
     function is easy to test and to call from a fresh process.
+
+    ``google_search`` runs the keyless Google News/Trends search first; the
+    existing research engine and the shared Gemini helper stay as fallbacks.
     """
     limit = max(1, int(limit))
     niche = " ".join((niche or "").split()) or "fitness"
+
+    # 0) Google Search (News + Trends RSS) — no API key, no Gemini grounding
+    # quota. Only niche-matched headlines survive.
+    if google_search:
+        try:
+            candidates = google_topic_candidates(
+                niche,
+                region=region or "IN",
+                language=language or "Hindi",
+                limit=limit,
+                fetcher=google_fetcher,
+            )
+            normalised = [
+                cleaned
+                for raw in candidates
+                if (cleaned := _normalise_topic(raw, niche))
+            ]
+            if normalised:
+                return _dedupe(normalised)[:limit]
+            log.info("Google search returned no niche-matched topics")
+        except Exception as exc:  # noqa: BLE001 - research must never crash the bot
+            log.warning("Google topic search failed: %s", str(exc)[:200])
 
     # 1) Preferred path: reuse the existing research engine (real sources).
     if engine is not None:

@@ -155,6 +155,22 @@ Only the owner can use them: `AUTOPILOT_OWNER_IDS` if set, otherwise
 A candidate whose rights snapshot is not verified cannot be published or
 scheduled, even by tapping the button.
 
+### How the clip looks
+
+```dotenv
+SHORTS_VERTICAL_MODE=fit   # default: whole frame visible, blurred sides
+AUTONOMOUS_BURN_CAPTION=true
+AUTONOMOUS_CAPTION_POSITION=bottom
+```
+
+`fit` shrinks the source until it fits 1080x1920 and paints the empty area with
+a blurred copy of the same frame, so nothing is cut off — a landscape interview
+keeps both speakers and the whole screen. `crop` restores the older behaviour
+(zoom to fill, sides cut away).
+
+The burned-in line is the clip's own `hook_summary` from the analyzer (title as
+fallback), capped at ~80 characters and wrapped inside the Shorts safe area.
+
 ---
 
 ## 4. Daily quota keys

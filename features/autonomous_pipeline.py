@@ -261,6 +261,54 @@ def prepare_short(
     return brief
 
 
+def _caption_text(brief: dict, limit: int = 80) -> str:
+    """Pick the short on-screen line for a clip.
+
+    ``hook_summary`` is what the analyzer says actually happens in this clip,
+    so it is the most content-related line available; the title is the
+    fallback. Long text is cut at a word boundary — a wall of text is worse
+    than no text at all.
+    """
+    for key in ("hook_summary", "title"):
+        text = " ".join(str(brief.get(key) or "").split())
+        if len(text) < 6:
+            continue
+        if len(text) > limit:
+            text = text[:limit].rsplit(" ", 1)[0].rstrip(" ,.:;!-") + "…"
+        return text
+    return ""
+
+
+def _burn_caption(
+    deps: PipelineDeps,
+    clip: dict,
+    caption: str,
+    position: str = "bottom",
+) -> str:
+    """Burn ``caption`` onto the clip; return the new path or "" on failure."""
+    original = Path(str(clip.get("clip_path") or ""))
+    if not original.is_file():
+        return ""
+    try:
+        from pipeline.overlay import TextOverlayEngine
+
+        engine = TextOverlayEngine(deps.cfg)
+        if not engine.available(deps.cfg):
+            log.warning("Text overlay unavailable; keeping the plain clip")
+            return ""
+        rendered = engine.apply(original, caption, position=position)
+    except Exception:  # noqa: BLE001 - a caption must never lose the clip
+        log.exception("Could not burn the caption onto %s", original.name)
+        return ""
+
+    if not rendered or not Path(rendered).is_file():
+        return ""
+    # The un-captioned clip is dead weight now (tens of MB per cycle).
+    delete_file(original)
+    log.info("Caption burned onto %s: %s", Path(rendered).name, caption[:60])
+    return str(rendered)
+
+
 def _attribution_line(source: dict, rights: dict) -> str:
     title = source.get("title") or "source video"
     channel = source.get("channel") or "original creator"
@@ -819,6 +867,7 @@ def _process_source(
             clip_max_seconds=aconf.clip_max_seconds,
             max_clips=aconf.max_clips_per_source,
             source_duration=duration,
+            mode=aconf.vertical_mode,
         )
         if not clips:
             deps.store.remember_source(source, status="no_clips")
@@ -848,6 +897,18 @@ def _process_source(
                 log.exception("Metadata generation failed for %s", clip["clip_path"])
                 delete_file(clip["clip_path"])
                 continue
+
+            # Burn the clip's own hook line onto the pixels. Uses the same
+            # drawtext engine (fonts + safe-area wrapping) as the owner flow;
+            # a failure keeps the plain clip instead of losing the candidate.
+            if aconf.burn_caption:
+                caption = _caption_text(brief)
+                if caption:
+                    burned = _burn_caption(
+                        deps, clip, caption, aconf.caption_position
+                    )
+                    if burned:
+                        clip = dict(clip, clip_path=burned)
 
             record = _queue_candidate(deps, ctx, source, decision, topic, clip, brief)
             if record is None:

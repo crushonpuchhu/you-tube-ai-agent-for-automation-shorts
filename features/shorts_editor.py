@@ -85,12 +85,39 @@ def has_disk_space(path: str | Path, needed_bytes: int) -> bool:
     return usage.free >= max(0, int(needed_bytes))
 
 
-def build_vertical_filter(width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT) -> str:
+VERTICAL_FIT = "fit"
+VERTICAL_CROP = "crop"
+
+
+def build_vertical_filter(
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    mode: str = VERTICAL_FIT,
+    blur_strength: int = 40,
+) -> str:
+    """Build the FFmpeg filter chain that turns a landscape frame into 9:16.
+
+    ``fit`` (default) keeps the **whole** source frame visible and fills the
+    empty top/bottom area with a blurred, zoomed copy of it. ``crop`` is the
+    old behaviour: it zooms until the frame fills 9:16 and cuts the sides off,
+    which is why speakers and screens ended up half out of frame.
+    """
     width = max(2, int(width))
     height = max(2, int(height))
+    if str(mode).lower() == VERTICAL_CROP:
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},setsar=1"
+        )
+    blur = max(2, int(blur_strength))
     return (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},setsar=1"
+        # Two copies of the same frame: one blurred to fill the canvas, one
+        # shrunk to fit inside it. Nothing is ever cropped out of the source.
+        "split=2[bg][fg];"
+        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},boxblur={blur}:2[bgb];"
+        f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fgs];"
+        "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
 
 
@@ -103,6 +130,7 @@ def cut_vertical_clip(
     ffmpeg: str = "ffmpeg",
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    mode: str = VERTICAL_FIT,
 ) -> Path:
     """Cut one 9:16 clip, preserving the source file."""
     source = Path(source_path)
@@ -127,10 +155,10 @@ def cut_vertical_clip(
         str(source),
         "-t",
         f"{duration:.3f}",
-        "-vf",
-        build_vertical_filter(width, height),
+        "-filter_complex",
+        f"[0:v]{build_vertical_filter(width, height, mode)}[v]",
         "-map",
-        "0:v:0",
+        "[v]",
         "-map",
         "0:a:0?",
         "-c:v",
@@ -170,6 +198,7 @@ def validate_and_cut(
     source_duration: float = 0,
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    mode: str = VERTICAL_FIT,
 ) -> list[dict]:
     """Validate moments against the real media and render each clip.
 
@@ -215,6 +244,7 @@ def validate_and_cut(
                 ffmpeg=ffmpeg,
                 width=width,
                 height=height,
+                mode=mode,
             )
         except ShortsEditorError as exc:
             log.warning("Clip %d could not be rendered: %s", index, exc)

@@ -120,6 +120,12 @@ class AutonomousConfig:
     max_clips_per_source: int
     clip_min_seconds: int
     clip_max_seconds: int
+    # "fit" keeps the whole source frame (blurred sides) — the default.
+    # "crop" zooms to fill 9:16 and cuts the left/right edges off.
+    vertical_mode: str
+    # Burn a short line of text (the clip's own hook) onto the video.
+    burn_caption: bool
+    caption_position: str
 
     # ---- quotas / safety ------------------------------------------------
     max_daily_source_downloads: int
@@ -220,6 +226,14 @@ class AutonomousConfig:
             max_clips_per_source=max(1, _int("MAX_CLIPS_PER_SOURCE", 5)),
             clip_min_seconds=max(1, _int("CLIP_MIN_SECONDS", 20)),
             clip_max_seconds=max(2, _int("CLIP_MAX_SECONDS", 55)),
+            # Landscape source into a 9:16 Short: "fit" (default) shows the
+            # whole frame with blurred sides; "crop" cuts the sides off.
+            vertical_mode=(_env("SHORTS_VERTICAL_MODE", "fit") or "fit").lower(),
+            # Burn the clip's own hook line onto the video for engagement.
+            burn_caption=_bool("AUTONOMOUS_BURN_CAPTION", True),
+            caption_position=(
+                _env("AUTONOMOUS_CAPTION_POSITION", "bottom") or "bottom"
+            ).lower(),
             max_daily_source_downloads=max(
                 0, _int("MAX_DAILY_SOURCE_DOWNLOADS", 5)
             ),

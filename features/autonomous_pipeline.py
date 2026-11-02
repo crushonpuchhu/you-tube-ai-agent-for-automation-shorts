@@ -169,6 +169,7 @@ _SKIP_LABELS = {
     "rights": "failed the rights gate (no verified reuse basis)",
     "download_disabled": "skipped: AUTONOMOUS_ALLOW_DOWNLOAD is off",
     "download_failed": "download blocked or failed (add data/cookies.txt)",
+    "download_botcheck": "YouTube asked for a fresh sign-in — cookies.txt is missing, incomplete or expired (re-export via /autopilot_cookies)",
     "too_short": "shorter than YOUTUBE_MIN_SOURCE_VIDEO_MINUTES",
     "too_long": "longer than MAX_SOURCE_VIDEO_MINUTES",
     "disk_space": "not enough free disk space",
@@ -710,8 +711,10 @@ def run_autonomous_cycle(deps: PipelineDeps, *, manual: bool = False) -> CycleRe
                 "· Add long videos (5 min+) to <code>data/autonomous_sources/</code> "
                 "with a matching <code>&lt;file&gt;.rights.json</code> "
                 "containing <code>\"confirmed\": true</code>, or\n"
-                "· Put a signed-in YouTube <code>cookies.txt</code> at "
-                "<code>data/cookies.txt</code> so CC downloads are allowed, or\n"
+                "· Upload <b>fresh</b> YouTube cookies: send a <code>cookies.txt</code> "
+                "file, then reply <code>/autopilot_cookies</code>. It must contain "
+                "<code>SID</code> and <code>HSID</code> (enable HttpOnly cookies "
+                "when exporting), or\n"
                 "· Add permitted channels to <code>SOURCE_ALLOWLIST</code>.",
                 dedupe=f"no_source:{day}",
                 manual=manual,
@@ -808,7 +811,12 @@ def _process_source(
                 downloaded = True
             except SourceDownloadError as exc:
                 log.warning("Download skipped for %s: %s", source.get("video_id"), exc)
-                return [], f"download_failed:{source.get('video_id')}"
+                reason = (
+                    "download_botcheck"
+                    if "not a bot" in str(exc).lower()
+                    else "download_failed"
+                )
+                return [], f"{reason}:{source.get('video_id')}"
 
         try:
             duration = probe_duration(source_path, deps.cfg.ffprobe_path)

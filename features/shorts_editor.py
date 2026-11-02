@@ -43,6 +43,13 @@ def _run(args: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess:
         ) from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()[:400]
+        if not detail and exc.returncode < 0:
+            # A SIGKILL leaves no stderr — on a small instance this is almost
+            # always the kernel's OOM killer picking ffmpeg.
+            detail = (
+                f"process killed by signal {-exc.returncode} "
+                "(out of memory or resource limit)"
+            )
         raise ShortsEditorError(f"{Path(args[0]).name} failed: {detail}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ShortsEditorError(f"{Path(args[0]).name} timed out") from exc
@@ -110,15 +117,79 @@ def build_vertical_filter(
             f"crop={width}:{height},setsar=1"
         )
     blur = max(2, int(blur_strength))
+    # Blur a quarter-size copy and scale it back up. A blurred backdrop has no
+    # fine detail to preserve, while boxblur on a full 1080x1920 frame allocates
+    # several full-size planes — enough to get ffmpeg OOM-killed on a ~1 GB
+    # instance right after the Gemini upload spikes the parent process.
+    blur_width = max(2, width // 4)
+    blur_height = max(2, height // 4)
+    blur_radius = max(2, blur // 4)
     return (
         # Two copies of the same frame: one blurred to fill the canvas, one
         # shrunk to fit inside it. Nothing is ever cropped out of the source.
         "split=2[bg][fg];"
-        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},boxblur={blur}:2[bgb];"
+        f"[bg]scale={blur_width}:{blur_height}:force_original_aspect_ratio=increase,"
+        f"crop={blur_width}:{blur_height},boxblur={blur_radius}:2,"
+        f"scale={width}:{height}[bgb];"
         f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fgs];"
         "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
+
+
+def _build_clip_args(
+    source: Path,
+    start: float,
+    duration: float,
+    output: Path,
+    *,
+    ffmpeg: str,
+    width: int,
+    height: int,
+    mode: str,
+    low_memory: bool,
+) -> list[str]:
+    """Assemble the ffmpeg argument list for one clip render."""
+    threads = "1" if low_memory else "2"
+    return [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        str(source),
+        "-t",
+        f"{duration:.3f}",
+        "-filter_complex_threads",
+        threads,
+        "-filter_complex",
+        f"[0:v]{build_vertical_filter(width, height, mode)}[v]",
+        "-map",
+        "[v]",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast" if low_memory else "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        threads,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(output),
+    ]
 
 
 def cut_vertical_clip(
@@ -143,46 +214,43 @@ def cut_vertical_clip(
         raise ShortsEditorError("Clip end must be after its start.")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    args = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-ss",
-        f"{start:.3f}",
-        "-i",
-        str(source),
-        "-t",
-        f"{duration:.3f}",
-        "-filter_complex",
-        f"[0:v]{build_vertical_filter(width, height, mode)}[v]",
-        "-map",
-        "[v]",
-        "-map",
-        "0:a:0?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        "-avoid_negative_ts",
-        "make_zero",
-        str(output),
-    ]
-    _run(args, timeout=max(300, int(duration * 20)))
-    if not output.is_file() or output.stat().st_size < 1024:
-        raise ShortsEditorError(f"FFmpeg produced no usable clip at {output}")
-    return output
+
+    # Normal profile first; if ffmpeg is OOM-killed (small instances, right
+    # after a large upload) retry once at 720x1280 with one encoder/filter
+    # thread. That is still a valid 9:16 Short, just lighter to render.
+    profiles: list[tuple[int, int, bool]] = [(width, height, False)]
+    low_w, low_h = max(2, min(width, 720)), max(2, min(height, 1280))
+    if (low_w, low_h) != (width, height):
+        profiles.append((low_w, low_h, True))
+
+    last_error: ShortsEditorError | None = None
+    for attempt, (w, h, low_memory) in enumerate(profiles):
+        if attempt:
+            log.warning(
+                "Clip render failed; retrying at %sx%s with the low-memory profile (%s)",
+                w, h, last_error,
+            )
+        args = _build_clip_args(
+            source,
+            start,
+            duration,
+            output,
+            ffmpeg=ffmpeg,
+            width=w,
+            height=h,
+            mode=mode,
+            low_memory=low_memory,
+        )
+        try:
+            _run(args, timeout=max(300, int(duration * 20)))
+        except ShortsEditorError as exc:
+            last_error = exc
+            continue
+        if output.is_file() and output.stat().st_size >= 1024:
+            return output
+        last_error = ShortsEditorError(f"FFmpeg produced no usable clip at {output}")
+
+    raise last_error or ShortsEditorError(f"FFmpeg produced no usable clip at {output}")
 
 
 def validate_and_cut(

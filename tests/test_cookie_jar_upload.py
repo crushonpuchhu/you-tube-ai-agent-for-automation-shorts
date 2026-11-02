@@ -39,6 +39,31 @@ class CookieJarTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Netscape", detail)
 
+    def test_jar_without_primary_session_cookie_rejected(self):
+        # Exactly the production failure: secure third-party cookies only, so
+        # YouTube still says "Sign in to confirm you're not a bot".
+        text = (
+            ".youtube.com\tTRUE\t/\tTRUE\t1799999999\t__Secure-3PSID\tabc\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1799999999\t__Secure-3PAPISID\tdef\n"
+        )
+        ok, detail = cookie_jar_status(text)
+        self.assertFalse(ok)
+        self.assertIn("not signed in", detail)
+
+    def test_primary_without_companion_rejected(self):
+        text = ".youtube.com\tTRUE\t/\tTRUE\t1799999999\tSID\tabc\n"
+        ok, detail = cookie_jar_status(text)
+        self.assertFalse(ok)
+        self.assertIn("companion", detail)
+
+    def test_secure_style_signed_in_jar_accepted(self):
+        text = (
+            ".youtube.com\tTRUE\t/\tTRUE\t1799999999\t__Secure-1PSID\tabc\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1799999999\t__Secure-1PAPISID\tdef\n"
+        )
+        ok, _ = cookie_jar_status(text)
+        self.assertTrue(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

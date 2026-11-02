@@ -278,6 +278,9 @@ class TextOverlayEngine:
                 "-vf", filt,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-pix_fmt", "yuv420p",
+                # Keep the encoder single-threaded: the target box has ~1 GB
+                # RAM, and the default thread count spikes memory on 1080x1920.
+                "-threads", "1",
             ]
             if info.has_audio:
                 # Copy audio bit-for-bit: no re-encode, no drift.

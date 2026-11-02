@@ -153,6 +153,24 @@ def build_approval_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
 
 
 # -------------------------------------------------------------------- commands
+def _cookie_status_line(aconf) -> str:
+    """One-line health check for the yt-dlp cookie jar shown in /autopilot_status."""
+    cookie_path = str(getattr(aconf, "ytdlp_cookiefile", "") or "")
+    if not cookie_path:
+        return "🍪 <b>Download cookies:</b> ⭕ not configured (use /autopilot_cookies)"
+    path = Path(cookie_path).expanduser()
+    if not path.is_file():
+        return "🍪 <b>Download cookies:</b> ❌ configured file is missing"
+    try:
+        ok, detail = cookie_jar_status(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+    except OSError as exc:
+        return f"🍪 <b>Download cookies:</b> ❌ unreadable ({html.escape(str(exc)[:80])})"
+    icon = "✅" if ok else "❌"
+    return f"🍪 <b>Download cookies:</b> {icon} {html.escape(detail)}"
+
+
 async def cmd_autopilot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update, context):
         await _deny(update)
@@ -195,6 +213,7 @@ async def cmd_autopilot_status(update: Update, context: ContextTypes.DEFAULT_TYP
         "",
         "<b>Flags</b>",
         " · ".join(flags),
+        _cookie_status_line(aconf),
         "",
         f"🕒 <b>Next configured slot:</b> {_pretty(str(snapshot.get('next_run') or ''))}",
         f"📥 <b>Pending approval:</b> {pending}",
@@ -687,7 +706,7 @@ async def cmd_autopilot_add_source(
 
 # ------------------------------------------------------------- cookie jar
 def cookie_jar_status(text: str) -> tuple[bool, str]:
-    """Check that an uploaded file really is a Netscape cookies.txt with YouTube."""
+    """Check that an uploaded file really is a signed-in YouTube cookies.txt."""
     if not (text or "").strip():
         return False, "File is empty."
     rows = [
@@ -706,7 +725,25 @@ def cookie_jar_status(text: str) -> tuple[bool, str]:
             "Cookie lines are not in Netscape cookies.txt format. "
             "Export with the 'Get cookies.txt LOCALLY' extension.",
         )
-    return True, f"{len(youtube_rows)} youtube.com cookie line(s)"
+
+    names = {row.split("\t")[5].strip() for row in youtube_rows}
+    # A logged-in export always carries the primary session cookie. Without it
+    # YouTube keeps answering "Sign in to confirm you're not a bot" even though
+    # the file looks like a valid Netscape jar (this happened in production).
+    if not names & {"SID", "__Secure-1PSID"}:
+        return (
+            False,
+            "This jar is not signed in: it has no primary YouTube cookie "
+            "(SID or __Secure-1PSID). Open youtube.com while signed in, enable "
+            "'HttpOnly cookies' in the extension, and export again.",
+        )
+    if not names & {"HSID", "SSID", "APISID", "__Secure-1PAPISID", "__Secure-3PAPISID"}:
+        return (
+            False,
+            "This jar is missing the companion login cookies "
+            "(HSID/SSID/APISID). Re-export with HttpOnly cookies enabled.",
+        )
+    return True, f"{len(youtube_rows)} youtube.com cookie line(s), signed-in set present"
 
 
 async def cmd_autopilot_cookies(
@@ -725,8 +762,9 @@ async def cmd_autopilot_cookies(
         await message.reply_text(
             "🍪 <b>Upload YouTube cookies</b>\n\n"
             "1. Install the browser extension <b>Get cookies.txt LOCALLY</b>.\n"
-            "2. Open youtube.com while signed in and click the extension → "
-            "<b>Export</b> (Netscape format).\n"
+            "2. Sign in to youtube.com, then click the extension → <b>Export</b> "
+            "(Netscape format). Enable <b>HttpOnly cookies</b> in the extension "
+            "options — without them the export cannot download anything.\n"
             "3. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
             "then reply to it with <code>/autopilot_cookies</code>.\n\n"
             "This only fixes downloads; nothing is published without your approval.",

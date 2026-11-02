@@ -1315,6 +1315,18 @@ def build_application(cfg: Config) -> Application:
             _aconf.unattended_publish,
             _aconf.youtube_discovery_enabled,
         )
+        if _aconf.allow_download and not _aconf.ytdlp_cookiefile:
+            log.warning(
+                "AUTONOMOUS_ALLOW_DOWNLOAD is on but no YouTube cookies file is "
+                "configured. Datacenter IPs get 'Sign in to confirm you're not a "
+                "bot' and every remote download will fail. Send a cookies.txt to "
+                "the bot with /autopilot_cookies (or set YTDLP_COOKIEFILE)."
+            )
+        elif _aconf.ytdlp_cookiefile and not Path(_aconf.ytdlp_cookiefile).is_file():
+            log.warning(
+                "YTDLP_COOKIEFILE is set but the file is missing: %s",
+                _aconf.ytdlp_cookiefile,
+            )
     except Exception:  # noqa: BLE001 - existing functionality must survive
         log.exception("Autonomous feature wiring failed — bot continues unchanged")
 

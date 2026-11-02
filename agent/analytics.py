@@ -187,8 +187,15 @@ class YouTubeStats:
         names = [h.get("name") for h in column_header]
         return [dict(zip(names, row)) for row in rows]
 
-    def video_metrics(self, start: datetime, end: datetime) -> list[dict]:
-        """Per-video performance for the window (retention, likes, subs gained)."""
+    def video_metrics(self, start: datetime, end: datetime,
+                      video_ids: list[str] | None = None) -> list[dict]:
+        """Per-video performance for the window (retention, likes, subs gained).
+
+        Some channels reject the aggregate ``dimensions=video`` query with
+        HTTP 400 ("The query is not supported"), even for plain ``views``.
+        Those same channels *do* answer the metrics when filtered to one video
+        at a time, so fall back to that before giving up.
+        """
         base = "views,likes,comments,shares,subscribersGained,averageViewDuration,averageViewPercentage"
         attempts = [base, base + ",swipedAway", "views,likes,averageViewDuration,averageViewPercentage", "views"]
         last_error: Exception | None = None
@@ -202,8 +209,49 @@ class YouTubeStats:
                         "Analytics scope missing. Run: python scripts/youtube_auth.py --force"
                     ) from exc
                 continue
-        log.warning("Analytics video_metrics unavailable: %s", last_error)
+
+        if video_ids:
+            rows, fallback_error = self._video_metrics_by_id(video_ids, attempts, start, end)
+            if rows:
+                return rows
+            last_error = fallback_error or last_error
+
+        # Optional enrichment: the Data API still supplies views/likes/comments.
+        log.info("Analytics per-video metrics unavailable: %s", last_error)
         return []
+
+    def _video_metrics_by_id(
+        self, video_ids: list[str], attempts: list[str], start: datetime, end: datetime
+    ) -> tuple[list[dict], Exception | None]:
+        """Query one video at a time; returns (rows, last_error)."""
+        last_error: Exception | None = None
+        for metrics in attempts:
+            rows: list[dict] = []
+            failed = False
+            for video_id in video_ids:
+                try:
+                    result = self._query(
+                        metrics=metrics,
+                        dimensions=None,
+                        start=start,
+                        end=end,
+                        filters=f"video=={video_id}",
+                    )
+                except HttpError as exc:
+                    if _is_scope_error(exc):
+                        raise AuthRequired(
+                            "Analytics scope missing. Run: python scripts/youtube_auth.py --force"
+                        ) from exc
+                    last_error = exc
+                    failed = True
+                    break
+                if result:
+                    row = dict(result[0])
+                    row["videoId"] = video_id
+                    rows.append(row)
+            if not failed:
+                return rows, None
+        return [], last_error
 
     def daily_metrics(self, start: datetime, end: datetime) -> list[dict]:
         try:
@@ -283,7 +331,7 @@ class YouTubeStats:
         metric_rows: dict[str, dict] = {}
         try:
             start = now_ist() - timedelta(days=30)
-            for row in self.video_metrics(start, now_ist()):
+            for row in self.video_metrics(start, now_ist(), ids):
                 metric_rows[row.get("videoId") or row.get("video_id") or ""] = row
         except AuthRequired:
             raise

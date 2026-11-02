@@ -102,6 +102,21 @@ class JobStoreTests(unittest.TestCase):
             self.assertTrue(self.store.claim_daily("2026-01-01", "shorts", -1))
         self.assertEqual(self.store.daily_count("2026-01-01", "shorts"), 5)
 
+    def test_failed_work_can_release_its_reservation(self):
+        day = "2026-01-01"
+        self.assertTrue(self.store.claim_daily(day, "source_downloads", 2))
+        self.assertTrue(self.store.claim_daily(day, "source_downloads", 2))
+        self.assertFalse(self.store.claim_daily(day, "source_downloads", 2))
+
+        # A rejected download must not burn the day's quota.
+        self.store.release_daily(day, "source_downloads")
+        self.assertEqual(self.store.daily_count(day, "source_downloads"), 1)
+        self.assertTrue(self.store.claim_daily(day, "source_downloads", 2))
+
+    def test_release_daily_never_goes_negative(self):
+        self.store.release_daily("2026-01-01", "source_downloads")
+        self.assertEqual(self.store.daily_count("2026-01-01", "source_downloads"), 0)
+
     # ----------------------------------------------------------------- locks
     def test_single_flight_lock(self):
         self.assertTrue(self.store.try_acquire_lock("cycle", "a", ttl_seconds=60))

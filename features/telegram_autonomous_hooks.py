@@ -733,9 +733,11 @@ def cookie_jar_status(text: str) -> tuple[bool, str]:
     if not names & {"SID", "__Secure-1PSID"}:
         return (
             False,
-            "This jar is not signed in: it has no primary YouTube cookie "
-            "(SID or __Secure-1PSID). Open youtube.com while signed in, enable "
-            "'HttpOnly cookies' in the extension, and export again.",
+            "This jar is not signed in: it has no primary login cookie "
+            "(SID or __Secure-1PSID). The export is dropping HttpOnly cookies. "
+            "Enable 'Include HttpOnly cookies' in the extension, then export "
+            "from https://accounts.google.com while signed in (a youtube.com-only "
+            "jar cannot pass YouTube's bot check).",
         )
     if not names & {"HSID", "SSID", "APISID", "__Secure-1PAPISID", "__Secure-3PAPISID"}:
         return (
@@ -762,10 +764,15 @@ async def cmd_autopilot_cookies(
         await message.reply_text(
             "🍪 <b>Upload YouTube cookies</b>\n\n"
             "1. Install the browser extension <b>Get cookies.txt LOCALLY</b>.\n"
-            "2. Sign in to youtube.com, then click the extension → <b>Export</b> "
-            "(Netscape format). Enable <b>HttpOnly cookies</b> in the extension "
-            "options — without them the export cannot download anything.\n"
-            "3. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
+            "2. In the extension options, enable <b>Include HttpOnly cookies</b>. "
+            "Without it the export silently drops <code>SID</code>/"
+            "<code>HSID</code> and YouTube still says “sign in to confirm you're "
+            "not a bot”.\n"
+            "3. Sign in, open <b>https://accounts.google.com</b> (not only "
+            "youtube.com) and export in <b>Netscape</b> format. The file must "
+            "contain <code>.google.com</code> rows with <code>SID</code>, "
+            "<code>HSID</code> and <code>SSID</code>.\n"
+            "4. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
             "then reply to it with <code>/autopilot_cookies</code>.\n\n"
             "This only fixes downloads; nothing is published without your approval.",
             parse_mode=ParseMode.HTML,

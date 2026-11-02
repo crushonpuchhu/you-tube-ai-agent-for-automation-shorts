@@ -811,6 +811,12 @@ def _process_source(
                 downloaded = True
             except SourceDownloadError as exc:
                 log.warning("Download skipped for %s: %s", source.get("video_id"), exc)
+                # The download never happened: give the reservation back so a
+                # bot-check rejection cannot exhaust the whole day's quota.
+                try:
+                    deps.store.release_daily(day, "source_downloads")
+                except Exception:  # noqa: BLE001 - quota bookkeeping is best effort
+                    log.exception("Could not release the source-download quota")
                 reason = (
                     "download_botcheck"
                     if "not a bot" in str(exc).lower()

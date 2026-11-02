@@ -367,6 +367,30 @@ class JobStore:
             ).fetchone()
         return int(row["value"]) if row else 0
 
+    def release_daily(self, day: str, metric: str, amount: int = 1) -> None:
+        """Give back a reservation made by ``claim_daily`` when work failed.
+
+        A quota should only count work that actually happened. Before this,
+        a download killed by YouTube's bot check still burned the day's
+        allowance, so the next cycle was skipped with ``quota:source_downloads``.
+        """
+        amount = max(1, int(amount))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE autonomous_daily SET value=MAX(0, value-?) "
+                    "WHERE day=? AND metric=?",
+                    (amount, day, metric),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def daily_usage(self, day: str | None = None) -> dict[str, int]:
         day = day or now_ist().strftime("%Y-%m-%d")
         with self._conn() as conn:

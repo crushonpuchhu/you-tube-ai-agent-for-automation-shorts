@@ -82,10 +82,16 @@ RUN set -eu; cd /opt/bgutil/server \
 # sets the same value explicitly). Without it the database would fall back to
 # ~/.shorts-agent inside the container's writable layer — an empty database
 # that vanishes on every rebuild. Still mount /app/db (and /app/data) to keep it.
+#
+# XDG_CACHE_HOME: the container often runs under a user id that does not own
+# its /home (compose RUN_UID=1000), and yt-dlp's PO-token provider script plus
+# Deno need a writable cache directory. /app/data is always writable there, so
+# keep every cache on that volume.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Kolkata \
+    XDG_CACHE_HOME=/app/data/.cache \
     AGENT_DB_PATH=/app/db/agent.db
 
 WORKDIR /app

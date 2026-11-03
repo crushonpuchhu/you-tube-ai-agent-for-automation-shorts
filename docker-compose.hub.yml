@@ -15,7 +15,7 @@
 services:
   shorts-agent:
     # prebuilt image on Docker Hub (published by scripts/publish-dockerhub.sh)
-    image: tallermittal/youtubeshortsaiagent:latest
+    image: tallermittal/youtubeshortsaiagent:v4.10.2-potcache-20261103
     container_name: shorts-agent
     restart: unless-stopped
 

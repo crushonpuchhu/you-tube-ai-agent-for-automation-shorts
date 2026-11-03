@@ -42,6 +42,39 @@ zipfile.ZipFile(io.BytesIO(data)).extractall('/usr/local/bin'); \
 os.chmod('/usr/local/bin/deno', 0o755)" "$DENO_VERSION" "$deno_arch"; \
     deno --version
 
+# ---------------------------------------------------------------------------
+# bgutil PO Token provider — mints YouTube Proof-of-Origin tokens for yt-dlp.
+#
+# YouTube's playability gate on datacenter IPs (like this container on AWS)
+# answers "Sign in to confirm you're not a bot" even when a perfectly valid
+# signed-in cookie jar is passed; cookies alone stopped being sufficient there
+# in 2025. A PO token is the second half of that handshake — requests must
+# prove they come from a browser-shaped client, and bgutil generates those
+# attestation tokens by running Google's BotGuard challenge.
+#
+# Decomposed into two pieces, both installed here:
+#  * the yt-dlp plugin  -> `bgutil-ytdlp-pot-provider` in requirements.txt
+#  * the token provider -> the server/ script below, invoked per download by
+#    the plugin under the same Deno runtime installed above. yt-dlp only uses
+#    it when features.source_discovery passes YTDLP_POT_SERVER_HOME, which
+#    defaults to /opt/bgutil/server inside the image and is never passed on a
+#    machine where that directory is absent (local/dev runs).
+#
+# BGUTIL_VERSION must match the plugin version in requirements.txt.
+# ---------------------------------------------------------------------------
+ARG BGUTIL_VERSION=2.0.2
+RUN set -eu; \
+    python -c "import io, sys, tarfile, urllib.request; \
+url = 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/' + sys.argv[1] + '.tar.gz'; \
+data = urllib.request.urlopen(url, timeout=180).read(); \
+tarfile.open(fileobj=io.BytesIO(data), mode='r:gz').extractall('/tmp/bgutil')" "$BGUTIL_VERSION"; \
+    mv "/tmp/bgutil/bgutil-ytdlp-pot-provider-$BGUTIL_VERSION" /opt/bgutil; \
+    rm -rf /tmp/bgutil; \
+    chmod -R a+rX /opt/bgutil
+RUN set -eu; cd /opt/bgutil/server \
+    && deno install --allow-scripts=npm:canvas --frozen \
+    && chmod -R a+rX node_modules
+
 # PYTHONUNBUFFERED makes `docker logs -f` show output immediately; otherwise
 # Python buffers stdout and the terminal looks frozen until it exits.
 #

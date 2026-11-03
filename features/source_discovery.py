@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from datetime import datetime
@@ -217,29 +218,22 @@ def download_permitted_source(
             return f"duration exceeds {max_minutes} minutes"
         return None
 
-    options = {
-        "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
-        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "restrictfilenames": True,
-        "overwrites": False,
-        "writesubtitles": False,
-        "writeautomaticsub": False,
-        "match_filter": _match_filter,
-    }
-
-    # A signed-in cookie jar is the only reliable way to download from a
-    # datacenter IP; YouTube answers anonymous requests with
-    # "Sign in to confirm you're not a bot".
-    if cookiefile:
-        cookie_path = Path(str(cookiefile)).expanduser()
-        if cookie_path.is_file():
-            options["cookiefile"] = str(cookie_path)
-        else:
-            log.warning("YTDLP_COOKIEFILE configured but missing: %s", cookie_path)
+    options, can_retry_without_impersonation = _build_download_options(cookiefile)
+    options.update(
+        {
+            "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
+            "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "restrictfilenames": True,
+            "overwrites": False,
+            "writesubtitles": False,
+            "writeautomaticsub": False,
+            "match_filter": _match_filter,
+        }
+    )
 
     video_id = safe_filename(str(source.get("video_id") or "source"))
     try:
@@ -247,9 +241,25 @@ def download_permitted_source(
             info = ydl.extract_info(url, download=True)
             info = ydl.sanitize_info(info)
     except Exception as exc:  # noqa: BLE001 - upstream/network/format errors
-        raise SourceDownloadError(
-            f"yt-dlp could not download the permitted source: {str(exc)[:300]}"
-        ) from exc
+        if can_retry_without_impersonation and "impersonat" in str(exc).lower():
+            # curl_cffi is installed but this yt-dlp build does not support the
+            # requested impersonation target: retry with yt-dlp's default
+            # request handler instead of losing the source.
+            log.warning("Impersonation failed (%s); retrying without it", str(exc)[:120])
+            fallback = dict(options)
+            fallback.pop("impersonate", None)
+            try:
+                with yt_dlp.YoutubeDL(fallback) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    info = ydl.sanitize_info(info)
+            except Exception as exc2:  # noqa: BLE001
+                raise SourceDownloadError(
+                    f"yt-dlp could not download the permitted source: {str(exc2)[:300]}"
+                ) from exc2
+        else:
+            raise SourceDownloadError(
+                f"yt-dlp could not download the permitted source: {str(exc)[:300]}"
+            ) from exc
 
     candidates: list[str] = []
     for item in (info or {}).get("requested_downloads") or []:
@@ -281,6 +291,96 @@ def copy_owner_media_if_needed(source: dict, destination: Path) -> Path:
     if not target.exists():
         shutil.copy2(original, target)
     return target
+
+
+def _build_download_options(cookiefile: str = "") -> tuple[dict[str, Any], bool]:
+    """yt-dlp options for every permitted source download.
+
+    The agent downloads from a datacenter IP, where YouTube is far more
+    suspicious of automated requests than on a home connection. Each knob
+    (environment-overridable) matches a mitigation yt-dlp itself documents
+    for that street:
+
+    * ``impersonate``  — browser-like TLS fingerprint through curl_cffi; the
+      plain urllib handler is the first thing YouTube's bot filter looks at.
+    * ``sleep_interval_requests`` — paces API requests so a burst of
+      extractions does not trip the per-IP rate ceiling (which is what turns
+      a healthy session into a daily "sign in to confirm you're not a bot").
+    * ``extractor_args`` — mint Proof-of-Origin tokens with the bgutil
+      provider shipped inside the image. On datacenter IPs a signed-in cookie
+      jar alone no longer clears YouTube's playability gate.
+    * ``cookiefile`` — a signed-in jar is still required on top of all of the
+      above; anonymous downloads from datacenter IPs are always rejected.
+    """
+
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, "").strip() or default)
+        except ValueError:
+            return default
+
+    def _impersonate_target(name: str) -> Any | None:
+        # The Python API wants an ImpersonateTarget object, not the CLI string.
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+        except ImportError:  # pragma: no cover - yt-dlp present but old
+            return None
+        try:
+            return ImpersonateTarget(name)
+        except Exception:
+            return None
+
+    options: dict[str, Any] = {}
+    can_retry_without_impersonation = False
+
+    impersonate = os.getenv("YTDLP_IMPERSONATE", "chrome").strip()
+    if impersonate and impersonate.lower() not in {"off", "none", "no", "false"}:
+        target = _impersonate_target(impersonate)
+        if target is not None:
+            options["impersonate"] = target
+            can_retry_without_impersonation = True
+        else:
+            log.warning(
+                "Could not build yt-dlp impersonation target %r; "
+                "downloads will use the default HTTP handler", impersonate,
+            )
+            can_retry_without_impersonation = False
+
+    sleep_requests = _env_float("YTDLP_SLEEP_REQUESTS", 1.0)
+    if sleep_requests > 0:
+        options["sleep_interval_requests"] = sleep_requests
+
+    player_client = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
+    extractor_args: dict[str, Any] = {}
+    if player_client:
+        extractor_args["youtube"] = {
+            "player_client": [
+                part.strip() for part in player_client.split(",") if part.strip()
+            ]
+        }
+
+    # PO tokens: only wired up when the bgutil provider directory that the
+    # Dockerfile installs actually exists, so local/dev runs without it are
+    # unaffected.
+    pot_home = Path(
+        os.getenv("YTDLP_POT_SERVER_HOME", "/opt/bgutil/server")
+    ).expanduser()
+    if pot_home.is_dir():
+        extractor_args.setdefault("youtubepot-bgutilscript", {})[
+            "server_home"
+        ] = [str(pot_home)]
+
+    if extractor_args:
+        options["extractor_args"] = extractor_args
+
+    if cookiefile:
+        cookie_path = Path(str(cookiefile)).expanduser()
+        if cookie_path.is_file():
+            options["cookiefile"] = str(cookie_path)
+        else:
+            log.warning("YTDLP_COOKIEFILE configured but missing: %s", cookie_path)
+
+    return options, can_retry_without_impersonation
 
 
 def rights_audit_line(source: dict) -> str:

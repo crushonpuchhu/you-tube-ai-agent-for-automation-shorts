@@ -711,8 +711,10 @@ def run_autonomous_cycle(deps: PipelineDeps, *, manual: bool = False) -> CycleRe
                 "· Add long videos (5 min+) to <code>data/autonomous_sources/</code> "
                 "with a matching <code>&lt;file&gt;.rights.json</code> "
                 "containing <code>\"confirmed\": true</code>, or\n"
-                "· Upload <b>fresh</b> YouTube cookies: send a <code>cookies.txt</code> "
-                "file, then reply <code>/autopilot_cookies</code>. It must contain "
+                "· Upload <b>fresh</b> YouTube cookies (export from an "
+                "<b>incognito window</b> you then close, not your everyday "
+                "profile): send a <code>cookies.txt</code> file, then reply "
+                "<code>/autopilot_cookies</code>. It must contain "
                 "<code>SID</code> and <code>HSID</code> (enable HttpOnly cookies "
                 "when exporting), or\n"
                 "· Add permitted channels to <code>SOURCE_ALLOWLIST</code>.",

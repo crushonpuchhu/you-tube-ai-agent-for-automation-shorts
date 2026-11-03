@@ -11,4 +11,15 @@ rich==15.0.0
 # The `default` extra pulls in yt-dlp-ejs, the challenge-solver scripts yt-dlp
 # runs under Deno (installed earlier in this Dockerfile). Without it YouTube
 # downloads fail with "Only images are available for download".
-yt-dlp[default]>=2024.1.1
+#
+# The `curl-cffi` extra is what lets yt-dlp impersonate a real browser's TLS
+# fingerprint (YTDLP_IMPERSONATE). On the AWS datacenter IP the default urllib
+# handler gets "Sign in to confirm you're not a bot" on every request, even
+# with a valid signed-in cookie jar.
+#
+# bgutil-ytdlp-pot-provider mints YouTube Proof-of-Origin tokens (runs under
+# the Deno runtime installed by the Dockerfile). Fresh cookies + PO tokens
+# together are required to clear the playability gate on datacenter IPs;
+# cookies alone expire there within days.
+yt-dlp[default,curl-cffi]>=2024.1.1
+bgutil-ytdlp-pot-provider>=2.0.2

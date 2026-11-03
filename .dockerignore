@@ -32,6 +32,13 @@ data/*.db-*
 *.db
 *.db-wal
 *.db-shm
+# The cookie jar is a live YouTube login credential. Excluding it keeps a
+# (soon stale) jar from being baked into any image; a fresh one can only ever
+# reach the container through the data/ volume mount or /autopilot_cookies.
+data/cookies.txt
+data/cookies.txt.tmp
+# Owner-provided source media and their rights sidecars are runtime data.
+data/autonomous_sources/
 
 # --- Local editor / tooling noise ------------------------------------------
 .vscode/

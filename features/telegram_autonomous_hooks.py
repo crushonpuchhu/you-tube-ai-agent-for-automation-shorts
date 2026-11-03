@@ -763,18 +763,27 @@ async def cmd_autopilot_cookies(
     if document is None:
         await message.reply_text(
             "🍪 <b>Upload YouTube cookies</b>\n\n"
-            "1. Install the browser extension <b>Get cookies.txt LOCALLY</b>.\n"
+            "1. Install the browser extension <b>Get cookies.txt LOCALLY</b> "
+            "(allow it in private/incognito windows).\n"
             "2. In the extension options, enable <b>Include HttpOnly cookies</b>. "
             "Without it the export silently drops <code>SID</code>/"
             "<code>HSID</code> and YouTube still says “sign in to confirm you're "
             "not a bot”.\n"
-            "3. Sign in, open <b>https://accounts.google.com</b> (not only "
-            "youtube.com) and export in <b>Netscape</b> format. The file must "
-            "contain <code>.google.com</code> rows with <code>SID</code>, "
-            "<code>HSID</code> and <code>SSID</code>.\n"
-            "4. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
+            "3. Open a <b>fresh incognito / private window</b>, sign in there at "
+            "<b>https://accounts.google.com</b>, and export from that window in "
+            "<b>Netscape</b> format. The file must contain <code>.google.com</code> "
+            "rows with <code>SID</code>, <code>HSID</code> and <code>SSID</code>.\n"
+            "4. <b>Close that incognito window straight after exporting</b> and "
+            "don't browse YouTube in it. A jar exported from the browser profile "
+            "you use every day keeps getting rotated — it expires within a day. "
+            "An incognito jar you stop using after the export stays valid for "
+            "weeks or months.\n"
+            "5. Send the <code>cookies.txt</code> file here as a <b>file</b>, "
             "then reply to it with <code>/autopilot_cookies</code>.\n\n"
-            "This only fixes downloads; nothing is published without your approval.",
+            "The server automatically generates the PO tokens YouTube demands "
+            "from datacenter IPs, so this upload is only needed again when a "
+            "cycle reports a fresh sign-in error. Nothing is published without "
+            "your approval.",
             parse_mode=ParseMode.HTML,
         )
         return

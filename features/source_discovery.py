@@ -359,6 +359,14 @@ def _build_download_options(cookiefile: str = "") -> tuple[dict[str, Any], bool]
             ]
         }
 
+    # Some upstreams flag the server's own IP range regardless of cookies or
+    # PO tokens (datacenter ranges — AWS first among them). Routing just the
+    # download traffic through a different egress (Cloudflare WARP, a home
+    # SOCKS tunnel, a paid residential proxy) is then the only avenue left.
+    proxy = os.getenv("YTDLP_PROXY", "").strip()
+    if proxy and proxy.lower() not in {"off", "none", "no", "direct"}:
+        options["proxy"] = proxy
+
     # PO tokens: only wired up when the bgutil provider directory that the
     # Dockerfile installs actually exists, so local/dev runs without it are
     # unaffected.

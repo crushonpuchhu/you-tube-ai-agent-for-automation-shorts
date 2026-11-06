@@ -47,6 +47,18 @@ def main() -> None:
             logging.error("Setup problem: %s", p)
         raise SystemExit("Fix the problems above (see .env.example and README.md), then run again.")
 
+    # A full volume makes every SQLite write fail with "disk I/O error", which
+    # looks like DB corruption but is just no space left. Say so on boot — the
+    # scheduler's disk guard reclaims temporary files while running.
+    from agent.cleanup import free_bytes
+    free = free_bytes(LOG_DIR)
+    if free >= 0 and free < cfg.min_free_disk_mb * 1024 * 1024:
+        logging.error(
+            "LOW DISK WARNING: only %.0f MB free (threshold %d MB). SQLite writes "
+            "will fail with 'disk I/O error' until space is freed.",
+            free / 1e6, cfg.min_free_disk_mb,
+        )
+
     # Import after config validation so missing keys fail with a clear message first.
     from bot.app import build_application
     from pipeline.youtube_uploader import YouTubeUploader

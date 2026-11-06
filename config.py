@@ -150,6 +150,11 @@ class Config:
     # Storage hygiene — downloaded Shorts are deleted, not kept forever.
     delete_after_upload: bool
     video_retention_days: int
+    #: Disk guard: when free space on the data volume drops below this many MB,
+    #: the scheduler reclaims temporary files and logs a loud error. SQLite
+    #: writes fail with "disk I/O error" on a full volume, so this is the early
+    #: warning that keeps a full disk from silently breaking the agent.
+    min_free_disk_mb: int
 
     # Terminal UI — live dashboard instead of a scrolling log when on a TTY.
     terminal_ui: bool
@@ -201,6 +206,7 @@ class Config:
             max_video_bytes=int(max_mb * 1024 * 1024),
             delete_after_upload=_bool("DELETE_AFTER_UPLOAD", True),
             video_retention_days=max(0, _int("VIDEO_RETENTION_DAYS", 3)),
+            min_free_disk_mb=max(0, _int("MIN_FREE_DISK_MB", 500)),
             terminal_ui=_bool("TERMINAL_UI", False),
             db_path=db_path,
             daily_goal=_int("DAILY_SHORT_GOAL", 2),

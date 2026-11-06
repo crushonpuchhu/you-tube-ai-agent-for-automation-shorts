@@ -16,6 +16,13 @@ services:
     container_name: shorts-agent
     restart: unless-stopped
 
+    # Cap the container's own log so it can never fill a small disk by itself.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     # Run as YOUR host user (RUN_UID/RUN_GID in .env — `id -u` / `id -g`), not
     # as the image's appuser. Bind-mounted files are then written with the same
     # uid the host uses, so SQLite's WAL files and the refreshed YouTube token

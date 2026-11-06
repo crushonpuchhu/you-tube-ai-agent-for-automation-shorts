@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import timedelta
 
 from agent.analytics import YouTubeStats
@@ -34,6 +35,10 @@ RETRY_BASE_MINUTES = 5
 # Short is published, so a revoked refresh token is discovered within the hour
 # instead of at publish time.
 TOKEN_REFRESH_MINUTES = 45
+
+# How often the low-disk guard samples free space. A 30s tick would otherwise
+# run a statvfs syscall twice a minute for no benefit.
+DISK_GUARD_INTERVAL_SECONDS = 300
 
 
 class Scheduler:
@@ -59,6 +64,7 @@ class Scheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._workers: set[threading.Thread] = set()
+        self._last_disk_check = 0.0
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -86,6 +92,11 @@ class Scheduler:
             cleanup.sweep(self.db, VIDEO_DIR, self.cfg.video_retention_days)
         except Exception:  # noqa: BLE001 - hygiene must never break startup
             log.exception("Startup video sweep failed")
+        try:
+            from agent import cleanup
+            cleanup.sweep_downloads()
+        except Exception:  # noqa: BLE001
+            log.exception("Startup download sweep failed")
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
@@ -121,6 +132,51 @@ class Scheduler:
             )
             worker.start()
             self._workers.add(worker)
+
+        try:
+            self._disk_guard()
+        except Exception:  # noqa: BLE001 - hygiene must never kill the tick
+            log.exception("Disk guard failed")
+
+    # -------------------------------------------------------------- disk guard
+    def _disk_guard(self) -> None:
+        """Reclaim temporary files before a full volume breaks SQLite.
+
+        Runs at most once per DISK_GUARD_INTERVAL_SECONDS. SQLite answers every
+        write with "disk I/O error" when the filesystem is out of space, which
+        looks like database corruption but is really just a full disk — so act
+        on the first low reading instead of waiting for the daily sweep.
+        """
+        now = time.monotonic()
+        if now - self._last_disk_check < DISK_GUARD_INTERVAL_SECONDS:
+            return
+        self._last_disk_check = now
+
+        from agent import cleanup
+        from config import DATA_DIR
+
+        threshold_mb = max(0, int(getattr(self.cfg, "min_free_disk_mb", 500)))
+        if threshold_mb <= 0:
+            return
+        free = cleanup.free_bytes(DATA_DIR)
+        if free < 0 or free >= threshold_mb * 1024 * 1024:
+            return
+
+        log.error(
+            "LOW DISK: only %.0f MB free (threshold %d MB) — reclaiming temporary "
+            "files now. If this repeats, the volume needs more capacity.",
+            free / 1e6, threshold_mb,
+        )
+        cleanup.sweep_downloads(grace_seconds=120)
+        try:
+            from config import VIDEO_DIR
+            cleanup.sweep(self.db, VIDEO_DIR, retention_days=0)
+        except Exception:  # noqa: BLE001
+            log.exception("Emergency video sweep failed")
+
+        after = cleanup.free_bytes(DATA_DIR)
+        if after >= 0:
+            log.error("LOW DISK: %.0f MB free after reclaim", after / 1e6)
 
     # ------------------------------------------------------- recurring tasks
     def ensure_recurring(self) -> None:
@@ -280,6 +336,9 @@ class Scheduler:
             from agent import cleanup
             from config import VIDEO_DIR
             cleanup.sweep(self.db, VIDEO_DIR, self.cfg.video_retention_days)
+            # Leftover yt-dlp source downloads are temporary too — sweep them so
+            # a crashed cycle can never fill the volume (SQLite disk I/O error).
+            cleanup.sweep_downloads()
             return
 
         # [AUTONOMOUS-FITNESS-V2] Additive autonomous task dispatch hook.

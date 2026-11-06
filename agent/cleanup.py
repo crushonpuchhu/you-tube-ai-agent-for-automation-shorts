@@ -19,6 +19,8 @@ survive a restart, so it is only removed once its status says the job is done.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -124,3 +126,74 @@ def sweep(db, video_dir: str | Path, retention_days: int = 3) -> dict:
         log.info("Video cleanup: removed %d file(s), %.1f MB freed, %d kept",
                  stats["deleted"], stats["bytes"] / 1e6, stats["kept"])
     return stats
+
+
+# --------------------------------------------------------------- downloads
+# yt-dlp writes permitted source downloads into
+# `data/autonomous_sources/downloads/` (`<id>.fNNN.<ext>`, `<id>.temp.mp4`, …).
+# The pipeline deletes them in a `finally` block once a cycle finishes, but a
+# hard kill (container restart, OOM, or the disk filling up mid-download) skips
+# that block and leaves the bytes behind forever. Nothing else ever swept that
+# folder, so leftovers accumulated until the volume hit 100% and SQLite started
+# failing every write with "disk I/O error". This sweep closes that leak.
+
+def autonomous_downloads_dir() -> Path:
+    """Resolve the yt-dlp download folder without importing the feature module.
+
+    Mirrors ``AutonomousConfig.load()``: ``AUTONOMOUS_SOURCE_DIR`` when set
+    (relative paths resolve against the project root), otherwise
+    ``<data>/autonomous_sources``; downloads always live in ``downloads/``.
+    """
+    from config import DATA_DIR, ROOT
+
+    raw = os.getenv("AUTONOMOUS_SOURCE_DIR", "").strip()
+    if raw:
+        base = Path(raw).expanduser()
+        if not base.is_absolute():
+            base = ROOT / base
+    else:
+        base = Path(DATA_DIR) / "autonomous_sources"
+    return base / "downloads"
+
+
+def sweep_downloads(download_dir: str | Path | None = None,
+                    grace_seconds: int = ORPHAN_GRACE_SECONDS) -> dict:
+    """Remove leftover/partial source downloads. Safe to call on a timer.
+
+    Every file in this folder is temporary by design (the pipeline deletes its
+    own download after processing), so anything older than ``grace_seconds`` is
+    reclaimed. A short grace period avoids racing a download another thread
+    just finished but has not yet consumed.
+    """
+    directory = Path(download_dir) if download_dir is not None else autonomous_downloads_dir()
+    stats = {"deleted": 0, "bytes": 0, "kept": 0}
+    if not directory.is_dir():
+        return stats
+
+    cutoff = time.time() - max(0, int(grace_seconds))
+    for item in directory.iterdir():
+        if not item.is_file():
+            continue
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+        if stat.st_mtime > cutoff:
+            stats["kept"] += 1
+            continue
+        if delete_file(item):
+            stats["deleted"] += 1
+            stats["bytes"] += stat.st_size
+
+    if stats["deleted"]:
+        log.info("Download cleanup: removed %d leftover source file(s), %.1f MB freed",
+                 stats["deleted"], stats["bytes"] / 1e6)
+    return stats
+
+
+def free_bytes(path: str | Path) -> int:
+    """Free bytes on the filesystem holding ``path``; -1 when unreadable."""
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError:
+        return -1

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -1216,6 +1217,15 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     instead of letting the failure disappear silently.
     """
     err = context.error
+
+    # Long-polling network blips (httpx.ReadError, timeouts) arrive with
+    # update=None. PTB retries them automatically and there is no chat to
+    # answer, so log one line instead of a full traceback + owner alert —
+    # otherwise a flaky link floods the log with "handling NoneType" errors.
+    if update is None and isinstance(err, (NetworkError, TimedOut)):
+        log.warning("Telegram network error (polling will retry): %s", err)
+        return
+
     log.exception("Unhandled error while handling %s", type(update).__name__,
                   exc_info=err)
 

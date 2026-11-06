@@ -167,7 +167,10 @@ class Scheduler:
             "files now. If this repeats, the volume needs more capacity.",
             free / 1e6, threshold_mb,
         )
-        cleanup.sweep_downloads(grace_seconds=120)
+        # 30 minutes: a cycle consumes its download within minutes, so anything
+        # still sitting here is a leaked leftover — and this cannot race the
+        # source file of a cycle that is still analysing/rendering.
+        cleanup.sweep_downloads(grace_seconds=1800)
         try:
             from config import VIDEO_DIR
             cleanup.sweep(self.db, VIDEO_DIR, retention_days=0)
